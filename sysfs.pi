@@ -1,0 +1,112 @@
+// What /dev/input and sysfs say of the input devices without opening any of them (Linux). A keyboard's capabilities can be read here
+// without opening the keyboard: only a node that is a joystick is ever opened.
+import { readDir, readText } from "std/fs"
+import { ABS_MAX, EV_ABS, EV_REL, KEY_MAX } from "./ioctl"
+import { classify, codesOfSysfs } from "./decode"
+
+/// Whether `s` is one or more decimal digits.
+export function isDigits(s: string): bool {
+  if (s.length == 0) {
+    return false
+  }
+  for (let i = 0; i < s.length; i++) {
+    if ("0123456789".indexOf(s.slice(i, i + 1)) < 0) {
+      return false
+    }
+  }
+  return true
+}
+
+/// `name` is `prefix` and a number: that number, else -1.
+export function numberAfter(name: string, prefix: string): int {
+  if (!name.startsWith(prefix)) {
+    return -1
+  }
+  const text = name.slice(prefix.length)
+  return if (isDigits(text)) parseInt(text) else -1
+}
+
+/// A hex number (`1209`) as an int, or -1.
+export function parseHex(s: string): int {
+  const digits = "0123456789abcdef"
+  let v = 0
+  if (s.length == 0) {
+    return -1
+  }
+  for (let i = 0; i < s.length; i++) {
+    const d = digits.indexOf(s.slice(i, i + 1).toLowerCase())
+    if (d < 0) {
+      return -1
+    }
+    v = v * 16 + d
+  }
+  return v
+}
+
+/// The text of a file, trimmed, or `otherwise` when it cannot be read.
+export async function readOr(path: string, otherwise: string): Promise<string> {
+  try {
+    return (await readText(path)).trim()
+  } catch (e: Error) {
+    return otherwise
+  }
+}
+
+/// A node of `<dev>/input`: `event3` is number 3.
+export class InputNode {
+  public name: string = ""
+  public path: string = ""
+  public number: int = 0
+}
+
+/// The `event*` nodes of `<dev>/input`, in number order (none when the directory cannot be listed).
+export async function eventNodes(dev: string = "/dev"): Promise<InputNode[]> {
+  const out: InputNode[] = []
+  try {
+    for await (const e of readDir(`${dev}/input`)) {
+      const n = numberAfter(e.name, "event")
+      if (n >= 0) {
+        const node = new InputNode()
+        node.name = e.name
+        node.path = `${dev}/input/${e.name}`
+        node.number = n
+        out.push(node)
+      }
+    }
+  } catch (e: Error) {
+    // No such directory (no input devices, or a sandbox): no nodes.
+  }
+  out.sort((a: InputNode, b: InputNode) => a.number - b.number)
+  return out
+}
+
+/// What sysfs says of a node: the name, the id, the serial number and the port, the capabilities, and the class they make.
+export class Sysfs {
+  public name: string = ""
+  public vendor: int = -1
+  public product: int = -1
+  public uniq: string = ""
+  public phys: string = ""
+  public abs: int[] = []
+  public keys: int[] = []
+  public kind: string = "?"
+}
+
+/// Reads `<sysfs>/class/input/<node>/device` (for a `js*` node that is the same input device its event node has). `isEvent` false
+/// is a joydev node, whose class is `joydev` whatever it has.
+export async function sysfsOf(sysfs: string, node: string, isEvent: bool = true): Promise<Sysfs> {
+  const out = new Sysfs()
+  const dir = `${sysfs}/class/input/${node}/device`
+  out.name = await readOr(`${dir}/name`, "")
+  const vendor = await readOr(`${dir}/id/vendor`, "")
+  const product = await readOr(`${dir}/id/product`, "")
+  out.vendor = parseHex(vendor)
+  out.product = parseHex(product)
+  out.uniq = await readOr(`${dir}/uniq`, "")
+  out.phys = await readOr(`${dir}/phys`, "")
+  const types = codesOfSysfs(await readOr(`${dir}/capabilities/ev`, ""), 31)
+  out.abs = codesOfSysfs(await readOr(`${dir}/capabilities/abs`, ""), ABS_MAX)
+  out.keys = codesOfSysfs(await readOr(`${dir}/capabilities/key`, ""), KEY_MAX)
+  out.kind = if (isEvent) classify(types.includes(EV_ABS), types.includes(EV_REL), out.abs, out.keys) else "joydev"
+  return out
+}

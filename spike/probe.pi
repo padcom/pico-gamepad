@@ -1,0 +1,296 @@
+// G0 spike: what a Linux machine says of its joysticks through evdev, and how a backend could read them by polling the kernel's
+// state. NOT the library (that is ../index.pi): a program for a machine with a radio, whose output is pasted back (see RUNSHEET.md).
+// It only reads: no EVIOCGRAB, no write, and a node that is not a joystick is opened for the permission test and closed again
+// without an ioctl or a read. It ran on the real TX16S (results in the team's notes).
+import { delay } from "std/timers"
+import {
+  ABSINFO_BYTES, ABS_MAX, EV_ABS, EV_KEY, KEY_MAX, absName, eviocgabs, eviocgbit, eviocgid, eviocgkey, eviocgname, eviocgphys,
+  eviocguniq, eviocgversion, hex, keyName,
+} from "../ioctl"
+import {
+  AbsInfo, chromiumId, codesOf, cText, errnoName, joydevButtonOrder, normalise, parseAbsInfo, parseId, s32At, testBit,
+} from "../decode"
+import { ask, closeFd, describe, factsOf, getegid, geteuid, groups, openRead } from "../posix"
+import { bar, fixed, modeText, tickStats } from "./format"
+import { Node, heading, ms, nowUs, readOr, signed, sysfsOf } from "./report"
+
+/// Section 1: who runs this, and on what.
+export async function who(): Promise<void> {
+  heading("1. who and what")
+  println(`euid ${geteuid()} egid ${getegid()} groups ${groups().join(",")}`)
+  const group = await readOr("/etc/group", "")
+  for (const line of group.split("\n")) {
+    if (line.startsWith("input:")) {
+      const gid = parseInt(line.split(":")[2])
+      const inGroup = groups().includes(gid) || (getegid() as int) == gid
+      println(`the group "input" is "${line}": we are ${if (inGroup) "IN" else "NOT in"} it`)
+    }
+  }
+  println(`kernel ${await readOr("/proc/sys/kernel/osrelease", "?")}`)
+  println("clock: performance.now() (the runtime's monotonic clock, nanoseconds); timer: delay() (setTimeout, whole milliseconds)")
+}
+
+/// Section 2: each node, with its mode, owner, device numbers, what open() says, and what sysfs and udev say of it.
+export async function listNodes(nodes: Node[]): Promise<void> {
+  heading("2. /dev/input: nodes, permissions, open(O_RDONLY|O_NONBLOCK), class")
+  if (nodes.length == 0) {
+    println("no event* or js* node at all")
+  }
+  for (const node of nodes) {
+    const facts = factsOf(node.path)
+    const sys = await sysfsOf(node)
+    node.kind = sys.kind
+    const fd = openRead(node.path)
+    node.opened = fd >= 0
+    const opened = if (fd >= 0) "open OK" else `open FAILED ${errnoName(-fd)} (${describe(-fd)})`
+    closeFd(fd)
+    const udev = await readOr(`/run/udev/data/c${facts.rdevMajor}:${facts.rdevMinor}`, "")
+    const udevText = if (udev == "") "udev data not readable" else if (udev.includes("ID_INPUT_JOYSTICK=1")) "udev ID_INPUT_JOYSTICK=1" else "udev: not a joystick"
+    const owner = if (facts.error != 0) `stat FAILED ${errnoName(facts.error)}` else `${modeText(facts.mode)} uid ${facts.uid} gid ${facts.gid} dev ${facts.rdevMajor}:${facts.rdevMinor}`
+    const idText = if (sys.vendor < 0) "?" else `${hex(sys.vendor, 4)}:${hex(sys.product, 4)}`
+    println(`${node.path}  ${owner}  ${opened}  class=${sys.kind}  ${udevText}`)
+    println(`    name "${sys.name}"  id ${idText}`)
+  }
+  println("(a node that is not a joystick was opened for the permission test only and closed at once: no ioctl, no read)")
+}
+
+/// A pad that is open: what the kernel says of it.
+export class Pad {
+  public path: string = ""
+  public fd: int = -1
+  public absCodes: int[] = []
+  public absInfo: AbsInfo[] = []
+  public keyCodes: int[] = []
+  public name: string = ""
+}
+
+/// Says that a call failed, with its errno.
+export function failed(what: string, r: int): void {
+  println(`${what} FAILED: ${errnoName(-r)} (${describe(-r)})`)
+}
+
+/// Section 3: opens an evdev node and prints everything the ioctls say of it. Null when it cannot be opened or does not answer.
+export async function probeEvdev(path: string): Promise<Pad?> {
+  heading(`3. evdev ${path}: identity, axes, buttons`)
+  const fd = openRead(path)
+  if (fd < 0) {
+    failed(`open ${path}`, fd)
+    return null
+  }
+  const pad = new Pad()
+  pad.path = path
+  pad.fd = fd
+  const version = new Uint8Array(4)
+  if (ask(fd, eviocgversion(), version) >= 0) {
+    println(`driver version 0x${hex(s32At(version, 0), 6)}`)
+  }
+  const idBuf = new Uint8Array(8)
+  const rId = ask(fd, eviocgid(), idBuf)
+  if (rId < 0) {
+    failed("EVIOCGID", rId)
+    closeFd(fd)
+    return null
+  }
+  const id = parseId(idBuf)
+  const nameBuf = new Uint8Array(256)
+  const physBuf = new Uint8Array(256)
+  const uniqBuf = new Uint8Array(256)
+  ask(fd, eviocgname(256), nameBuf)
+  ask(fd, eviocgphys(256), physBuf)
+  ask(fd, eviocguniq(256), uniqBuf)
+  pad.name = cText(nameBuf)
+  println(`name   "${pad.name}"`)
+  println(`id     bustype ${id.bustype} vendor ${hex(id.vendor, 4)} product ${hex(id.product, 4)} version ${hex(id.version, 4)}`)
+  println(`phys   "${cText(physBuf)}"   uniq "${cText(uniqBuf)}"`)
+  println(`the browser's id would be: ${chromiumId(pad.name, id.vendor, id.product)}`)
+  const types = new Uint8Array(4)
+  ask(fd, eviocgbit(0, 4), types)
+  println(`event types ${codesOf(types, 31).join(",")} (1 keys, 2 relative, 3 absolute)`)
+  if (!(await readAxes(pad))) {
+    closeFd(fd)
+    return null
+  }
+  readButtons(pad)
+  return pad
+}
+
+/// The axes: their codes, ranges and values now.
+async function readAxes(pad: Pad): Promise<bool> {
+  const absBits = new Uint8Array(8)
+  const rAbs = ask(pad.fd, eviocgbit(EV_ABS, 8), absBits)
+  if (rAbs < 0) {
+    failed("EVIOCGBIT(EV_ABS)", rAbs)
+  }
+  pad.absCodes = codesOf(absBits, ABS_MAX)
+  println(`axes: ${pad.absCodes.length}  (index = position in the ascending list of the codes, which is how Chromium numbers them)`)
+  for (let i = 0; i < pad.absCodes.length; i++) {
+    const code = pad.absCodes[i]
+    const buf = new Uint8Array(ABSINFO_BYTES)
+    const r = ask(pad.fd, eviocgabs(code), buf)
+    if (r < 0) {
+      failed(`EVIOCGABS(${code})`, r)
+      return false
+    }
+    const info = parseAbsInfo(buf)
+    pad.absInfo.push(info)
+    println(`  axis ${i}  code ${code} ${absName(code)}  range ${info.minimum}..${info.maximum}  flat ${info.flat}  fuzz ${info.fuzz}  resolution ${info.resolution}  value now ${info.value}`)
+  }
+  return true
+}
+
+/// The buttons: their codes in ascending order and in joydev's order.
+function readButtons(pad: Pad): void {
+  const keyBits = new Uint8Array(KEY_MAX / 8 + 1)
+  ask(pad.fd, eviocgbit(EV_KEY, keyBits.length), keyBits)
+  pad.keyCodes = codesOf(keyBits, KEY_MAX)
+  println(`buttons: ${pad.keyCodes.length}  (jstest and Chromium say 24 for the TX16S)`)
+  println(`  ascending: ${pad.keyCodes.map((c: int) => keyName(c)).join(" ")}`)
+  println(`  codes:     ${pad.keyCodes.map((c: int) => `0x${hex(c, 3)}`).join(" ")}`)
+  const order = joydevButtonOrder(pad.keyCodes)
+  println(`  joydev order (from BTN_MISC up, then the low codes): ${order.map((c: int) => `0x${hex(c, 3)}`).join(" ")}`)
+  println(`  the same as ascending: ${order.join(",") == pad.keyCodes.join(",")}`)
+}
+
+/// The state NOW: the raw value of every axis, and the indices of the buttons that are pressed. `error` is the errno (negative) of the
+/// ioctl that failed, and `failedCall` its name.
+class Reading {
+  public error: int = 0
+  public failedCall: string = ""
+  public raw: int[] = []
+  public pressed: int[] = []
+}
+
+function readState(pad: Pad, keys: Uint8Array, one: Uint8Array): Reading {
+  const out = new Reading()
+  for (let i = 0; i < pad.absCodes.length; i++) {
+    const r = ask(pad.fd, eviocgabs(pad.absCodes[i]), one)
+    if (r < 0) {
+      out.error = r
+      out.failedCall = `EVIOCGABS(${pad.absCodes[i]})`
+      return out
+    }
+    out.raw.push(s32At(one, 0))
+  }
+  const rk = ask(pad.fd, eviocgkey(keys.length), keys)
+  if (rk < 0) {
+    out.error = rk
+    out.failedCall = "EVIOCGKEY"
+    return out
+  }
+  for (let b = 0; b < pad.keyCodes.length; b++) {
+    if (testBit(keys, pad.keyCodes[b])) {
+      out.pressed.push(b)
+    }
+  }
+  return out
+}
+
+/// What a poll saw: the least and the most of every axis, how often every button was down, and why it ended (if it did).
+class Seen {
+  public lows: int[] = []
+  public highs: int[] = []
+  public down: int[] = []
+  public times: int[] = []
+  public ended: string = ""
+}
+
+/// Section 4: polls the kernel's state at `hz` for `seconds` (scheduled on absolute deadlines, so that a late tick does not push the
+/// next one), prints a line every quarter second, then the summaries.
+export async function poll(pad: Pad, seconds: int, hz: int): Promise<void> throws Error {
+  heading(`4. polling the state (EVIOCGABS and EVIOCGKEY) at ${hz} Hz for ${seconds} s: MOVE EVERY STICK TO ITS ENDS NOW`)
+  const seen = new Seen()
+  for (const info of pad.absInfo) {
+    seen.lows.push(info.maximum)
+    seen.highs.push(info.minimum)
+  }
+  for (const _code of pad.keyCodes) {
+    seen.down.push(0)
+  }
+  const keys = new Uint8Array(KEY_MAX / 8 + 1)
+  const one = new Uint8Array(ABSINFO_BYTES)
+  const periodUs = 1000000 / hz
+  // a line about four times a second
+  const every = if (hz < 4) 1 else hz / 4
+  const start = nowUs()
+  let next = start
+  let tick = 0
+  while (nowUs() - start < seconds * 1000000) {
+    const t = nowUs()
+    seen.times.push(t)
+    const reading = readState(pad, keys, one)
+    if (reading.error < 0) {
+      seen.ended = `${reading.failedCall} FAILED at tick ${tick}, ${ms(t - start)} ms into the run: ${errnoName(-reading.error)} (${describe(-reading.error)})`
+      break
+    }
+    note(pad, seen, reading)
+    if (tick % every == 0) {
+      printLine(pad, reading, t - start)
+    }
+    tick += 1
+    next += periodUs
+    if (next < nowUs() - 100000) {
+      next = nowUs()
+    }
+    const wait = (next - nowUs()) / 1000
+    if (wait > 0) {
+      await delay(wait)
+    }
+  }
+  summary(pad, seen)
+}
+
+function note(pad: Pad, seen: Seen, reading: Reading): void {
+  for (let i = 0; i < reading.raw.length; i++) {
+    if (reading.raw[i] < seen.lows[i]) {
+      seen.lows[i] = reading.raw[i]
+    }
+    if (reading.raw[i] > seen.highs[i]) {
+      seen.highs[i] = reading.raw[i]
+    }
+  }
+  for (const b of reading.pressed) {
+    seen.down[b] += 1
+  }
+}
+
+function printLine(pad: Pad, reading: Reading, sinceStartUs: int): void {
+  const parts: string[] = []
+  for (let i = 0; i < reading.raw.length; i++) {
+    parts.push(signed(normalise(reading.raw[i], pad.absInfo[i].minimum, pad.absInfo[i].maximum)))
+  }
+  const axes = parts.join(" ")
+  println(`t ${fixed((sinceStartUs as f64) / 1000000.0, 2)} s  axes ${axes}  pressed [${reading.pressed.join(",")}]`)
+}
+
+/// Section 5 and 6: what moved, and how the ticks went.
+function summary(pad: Pad, seen: Seen): void {
+  heading("5. what moved (the last axis values as bars)")
+  for (let i = 0; i < pad.absCodes.length; i++) {
+    const info = pad.absInfo[i]
+    const span = info.maximum - info.minimum
+    const moved = seen.highs[i] - seen.lows[i]
+    const verdict = if (moved * 10 >= span * 9) "reached both ends" else if (moved > 0) "moved" else "NEVER MOVED"
+    const low = normalise(seen.lows[i], info.minimum, info.maximum)
+    const high = normalise(seen.highs[i], info.minimum, info.maximum)
+    println(`  axis ${i} ${absName(pad.absCodes[i])}  seen ${seen.lows[i]}..${seen.highs[i]}  normalised ${signed(low)}..${signed(high)}  ${verdict}`)
+    println(`      lowest ${bar(low, 10)}  highest ${bar(high, 10)}`)
+  }
+  const used: string[] = []
+  const unused: string[] = []
+  for (let b = 0; b < pad.keyCodes.length; b++) {
+    if (seen.down[b] > 0) {
+      used.push(`${b}(${keyName(pad.keyCodes[b])}) in ${seen.down[b]} ticks`)
+    } else {
+      unused.push(`${b}`)
+    }
+  }
+  println(`  buttons seen pressed: ${if (used.length == 0) "none" else used.join(", ")}`)
+  println(`  buttons never pressed: ${unused.join(",")}`)
+  if (seen.ended != "") {
+    println(`  ENDED: ${seen.ended}`)
+  }
+  heading("6. tick jitter (gaps between the reads, on the monotonic clock)")
+  const stats = tickStats(seen.times)
+  println(`  ticks ${stats.ticks}  rate ${fixed(stats.perSecond, 2)}/s  gap mean ${ms(stats.meanUs)} min ${ms(stats.minUs)} p95 ${ms(stats.p95Us)} p99 ${ms(stats.p99Us)} max ${ms(stats.maxUs)} ms`)
+  println(`  gaps over 30 ms: ${stats.over30ms}   over 100 ms (the page's "late"): ${stats.over100ms}`)
+}

@@ -1,0 +1,124 @@
+// The C calls a device read needs (Linux), declared directly. `ioctl` is variadic in C: it is declared so here (`...`), and its third
+// argument is the address of a buffer (see `addr`). Nothing here knows what a joystick is.
+import { cText } from "./decode"
+
+export extern "C" {
+  function open(path: string, flags: c_int): c_int
+  function close(fd: c_int): c_int
+  function ioctl(fd: c_int, request: c_ulong, ...): c_int
+  function read(fd: c_int, buf: usize, count: usize): isize
+  function statx(dirfd: c_int, path: string, flags: c_int, mask: c_uint, buf: usize): c_int
+  function geteuid(): c_uint
+  function getegid(): c_uint
+  function getgroups(size: c_int, list: usize): c_int
+  function __errno_location(): ptr<c_int>
+  function strerror(e: c_int): ptr<u8>
+}
+
+/// Open flags (Linux, x86-64 and arm64): read only, do not wait for the device, close on exec.
+export const O_RDONLY: int = 0
+export const O_NONBLOCK: int = 0x800
+export const O_CLOEXEC: int = 0x80000
+
+/// The byte address of a view's first byte, for C. (The `ArrayBuffer`'s memory is the runtime's `__handle`.)
+export function addr(b: Uint8Array): usize {
+  return (b.buffer.__handle + b.byteOffset) as usize
+}
+
+/// `errno` after a failed call.
+export function errno(): int {
+  unsafe {
+    return __errno_location().read() as int
+  }
+}
+
+/// `strerror(e)`.
+export function describe(e: int): string {
+  unsafe {
+    return string.fromC(strerror(e as c_int))
+  }
+}
+
+/// Opens `path` for reading without waiting (and without taking the device from anyone: no `EVIOCGRAB`, no write). The descriptor, or
+/// the errno as a NEGATIVE number.
+export function openRead(path: string): int {
+  const fd = open(path, (O_RDONLY | O_NONBLOCK | O_CLOEXEC) as c_int) as int
+  if (fd < 0) {
+    return -errno()
+  }
+  return fd
+}
+
+/// Closes `fd` (nothing for a negative one).
+export function closeFd(fd: int): void {
+  if (fd >= 0) {
+    close(fd as c_int)
+  }
+}
+
+/// An `ioctl` that fills `buf`: what the call returned (0 or a length), or the errno as a NEGATIVE number.
+export function ask(fd: int, request: int, buf: Uint8Array): int {
+  const r = ioctl(fd as c_int, request as c_ulong, addr(buf)) as int
+  if (r < 0) {
+    return -errno()
+  }
+  return r
+}
+
+/// A `read` into `buf`: the number of bytes, or the errno as a NEGATIVE number (EAGAIN: nothing to read yet).
+export function readInto(fd: int, buf: Uint8Array): int {
+  const r = read(fd as c_int, addr(buf), buf.length as usize) as int
+  if (r < 0) {
+    return -errno()
+  }
+  return r
+}
+
+/// What `statx` says of a path: its mode, owner, group and device numbers; `error` is the errno (0 when it worked).
+export class FileFacts {
+  public error: int = 0
+  public mode: int = 0
+  public uid: int = 0
+  public gid: int = 0
+  public rdevMajor: int = 0
+  public rdevMinor: int = 0
+}
+
+/// `statx(AT_FDCWD, path)`: its layout is the same on every architecture (`stx_uid` at 20, `stx_gid` at 24, `stx_mode` at 28,
+/// `stx_rdev_major` at 128, `stx_rdev_minor` at 132; 256 bytes).
+export function factsOf(path: string): FileFacts {
+  const out = new FileFacts()
+  const buf = new Uint8Array(256)
+  // AT_FDCWD = -100, no flags (a symbolic link is followed), STATX_BASIC_STATS = 0x7ff
+  const r = statx(-100 as c_int, path, 0 as c_int, 0x7ff as c_uint, addr(buf)) as int
+  if (r < 0) {
+    out.error = errno()
+    return out
+  }
+  const u32 = (at: int): int => {
+    return (buf.get(at) as int) | ((buf.get(at + 1) as int) << 8) | ((buf.get(at + 2) as int) << 16) | ((buf.get(at + 3) as int) << 24)
+  }
+  out.uid = u32(20)
+  out.gid = u32(24)
+  out.mode = (buf.get(28) as int) | ((buf.get(29) as int) << 8)
+  out.rdevMajor = u32(128)
+  out.rdevMinor = u32(132)
+  return out
+}
+
+/// The groups this process is in (the effective one is not always among them).
+export function groups(): int[] {
+  const out: int[] = []
+  const room = new Uint8Array(4 * 256)
+  const n = getgroups(256 as c_int, addr(room)) as int
+  for (let i = 0; i < n; i++) {
+    const at = i * 4
+    out.push((room.get(at) as int) | ((room.get(at + 1) as int) << 8) | ((room.get(at + 2) as int) << 16) | ((room.get(at + 3) as int) << 24))
+  }
+  return out
+}
+
+/// The text of a buffer an `ioctl` filled with a name.
+export function textOf(b: Uint8Array): string {
+  return cText(b)
+}

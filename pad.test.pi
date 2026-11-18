@@ -1,0 +1,113 @@
+// An open pad over the fake system: what it says now, what unplugging does, closing, and what opening says.
+import { describe, it, expect } from "std/test"
+import { FakeSystem, fakeInfo } from "./fake"
+import { Pad, listPads, openPad } from "./pad"
+import { PadError } from "./types"
+
+const RADIO = "/dev/input/event11"
+
+function radio(): FakeSystem {
+  const system = new FakeSystem()
+  system.plug(fakeInfo("OpenTX Radiomaster TX16S Joystick", 0x1209, 0x4f54, 8, 24, "00000000001B", "usb-0000:00:03.0-2.1/input0", RADIO))
+  return system
+}
+
+async function codeOf(p: Promise<Pad, PadError>): Promise<string> {
+  try {
+    await p
+    return "ok"
+  } catch (e: PadError) {
+    return e.code
+  }
+}
+
+async function aListingIsWhatTheSystemSays(): Promise<void> throws Error {
+  const pads = await listPads(radio())
+  expect(pads.length).toBe(1)
+  expect(`${pads[0].id} ${pads[0].path} ${pads[0].axisCodes.length} ${pads[0].buttonCodes.length}`).toBe(`1209:4f54#00000000001B ${RADIO} 8 24`)
+  expect(pads[0].legacyId).toBe("OpenTX Radiomaster TX16S Joystick (Vendor: 1209 Product: 4f54)")
+}
+
+async function aStateIsWhatTheDeviceSaysNowAsRawAndNormalised(): Promise<void> throws Error {
+  const system = radio()
+  const pad = await openPad((await listPads(system))[0], system)
+  const device = system.device(RADIO)
+  device.set(0, 0)
+  device.set(1, 2047)
+  device.set(4, 0)
+  device.press(0)
+  device.press(23)
+  const s = pad.state()
+  expect(s.raw.join(",")).toBe("0,2047,1023,1023,0,1023,1023,1023")
+  expect(s.axes.length).toBe(8)
+  expect(`${Math.round(s.axes[0] * 1000.0)} ${Math.round(s.axes[1] * 1000.0)} ${Math.round(s.axes[2] * 1000.0)} ${Math.round(s.axes[4] * 1000.0)}`)
+    .toBe("-1000 1000 0 -1000")
+  expect(s.buttons.length).toBe(24)
+  expect(`${s.buttons[0]} ${s.buttons[1]} ${s.buttons[23]}`).toBe("true false true")
+  expect(`${pad.axes[7].name} ${pad.axes[7].minimum}..${pad.axes[7].maximum} flat ${pad.axes[7].flat} fuzz ${pad.axes[7].fuzz}`).toBe("ABS_RUDDER 0..2047 flat 127 fuzz 7")
+  pad.close()
+}
+
+async function everyStateIsAFreshRead(): Promise<void> throws Error {
+  const system = radio()
+  const pad = await openPad((await listPads(system))[0], system)
+  const device = system.device(RADIO)
+  const a = pad.state()
+  device.set(2, 500)
+  const b = pad.state()
+  expect(a.raw[2]).toBe(1023)
+  expect(b.raw[2]).toBe(500)
+  expect(device.reads).toBe(2)
+  expect(b.at >= a.at).toBe(true)
+  pad.close()
+}
+
+async function anUnpluggedPadIsToldAtTheNextRead(): Promise<void> throws Error {
+  const system = radio()
+  const pad = await openPad((await listPads(system))[0], system)
+  expect(pad.state().raw.length).toBe(8)
+  system.unplug(RADIO)
+  let code = "none"
+  try {
+    pad.state()
+  } catch (e: PadError) {
+    code = e.code
+  }
+  expect(code).toBe("DISCONNECTED")
+  pad.close()
+}
+
+async function aClosedPadSaysSoAndLetsGoOfTheDevice(): Promise<void> throws Error {
+  const system = radio()
+  const pad = await openPad((await listPads(system))[0], system)
+  const device = system.device(RADIO)
+  pad.close()
+  pad.close()
+  expect(device.closed).toBe(true)
+  let code = "none"
+  try {
+    pad.state()
+  } catch (e: PadError) {
+    code = e.code
+  }
+  expect(code).toBe("CLOSED")
+}
+
+async function openingSaysWhyItCannot(): Promise<void> throws Error {
+  const system = radio()
+  const info = (await listPads(system))[0]
+  system.denyOpens = 1
+  expect(await codeOf(openPad(info, system))).toBe("PERMISSION_DENIED")
+  expect(await codeOf(openPad(info, system))).toBe("ok")
+  system.unplug(RADIO)
+  expect(await codeOf(openPad(info, system))).toBe("NOT_FOUND")
+}
+
+describe("the pads of a system", () => {
+  it("are listed as the system says", aListingIsWhatTheSystemSays)
+  it("say what they say now, raw and from -1 to 1 by their declared range", aStateIsWhatTheDeviceSaysNowAsRawAndNormalised)
+  it("are read afresh by every state()", everyStateIsAFreshRead)
+  it("say DISCONNECTED at the next read once unplugged", anUnpluggedPadIsToldAtTheNextRead)
+  it("say CLOSED once closed, and let go of the device", aClosedPadSaysSoAndLetsGoOfTheDevice)
+  it("say why they cannot be opened", openingSaysWhyItCannot)
+})

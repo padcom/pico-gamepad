@@ -1,0 +1,88 @@
+// A tiny gamepad monitor: lists the pads, opens one and prints what it says 10 times a second, until it is unplugged.
+//
+//   pico run examples/pad-monitor.pi                       lists the pads
+//   pico run examples/pad-monitor.pi -- 0                  reads the first pad (a number of the list) until it is unplugged
+//   pico run examples/pad-monitor.pi -- --watch            tells the pads that are plugged in and out (Ctrl-C ends it)
+import { args, exit } from "std/process"
+import { delay } from "std/timers"
+import { Pad, PadError, PadEvent, PadInfo, listPads, openPad, watchPads } from "../index"
+
+/// A bar for -1 to 1: `[    |##  ]`, 5 cells each side of the middle.
+function bar(x: f64): string {
+  const half = 5
+  const rounded = Math.round((if (x < 0.0) -x else x) * (half as f64)) as int
+  const cells = if (rounded > half) half else rounded
+  const left = if (x < 0.0) " ".repeat(half - cells) + "#".repeat(cells) else " ".repeat(half)
+  const right = if (x > 0.0) "#".repeat(cells) + " ".repeat(half - cells) else " ".repeat(half)
+  return `[${left}|${right}]`
+}
+
+async function list(): Promise<PadInfo[]> {
+  const pads = await listPads()
+  if (pads.length == 0) {
+    println("no gamepad found (a radio shows up when it is plugged in; on Linux the desktop gives you access to it)")
+  }
+  for (let i = 0; i < pads.length; i++) {
+    const p = pads[i]
+    println(`${i}: ${p.name}  id ${p.id}  ${p.path}  ${p.axisCodes.length} axes, ${p.buttonCodes.length} buttons`)
+  }
+  return pads
+}
+
+async function monitor(pad: Pad): Promise<void> throws Error {
+  println(`${pad.info.name}: ${pad.axes.length} axes, ${pad.info.buttonCodes.length} buttons; unplug it to end`)
+  while (true) {
+    let line = ""
+    try {
+      const s = pad.state()
+      const bars: string[] = []
+      for (const x of s.axes) {
+        bars.push(bar(x))
+      }
+      const down: int[] = []
+      for (let i = 0; i < s.buttons.length; i++) {
+        if (s.buttons[i]) {
+          down.push(i)
+        }
+      }
+      line = `${bars.join(" ")}  buttons [${down.join(",")}]`
+    } catch (e: PadError) {
+      println(`${e.code}: ${e.message}`)
+      return
+    }
+    println(line)
+    await delay(100)
+  }
+}
+
+async function watch(): Promise<void> throws Error {
+  println("watching (Ctrl-C ends)")
+  const w = watchPads((e: PadEvent) => println(`${e.kind} ${e.pad.name} ${e.pad.path} ${e.code}`))
+  await w.done()
+}
+
+async function main(): Promise<void> throws Error {
+  if (args.length > 0 && args[0] == "--watch") {
+    await watch()
+    return
+  }
+  const pads = await list()
+  if (args.length == 0) {
+    return
+  }
+  const n = parseInt(args[0])
+  if (n < 0 || n >= pads.length) {
+    println(`there is no pad ${args[0]}`)
+    exit(2)
+  }
+  try {
+    const pad = await openPad(pads[n])
+    await monitor(pad)
+    pad.close()
+  } catch (e: PadError) {
+    println(`${e.code}: ${e.message}`)
+    exit(1)
+  }
+}
+
+await main()

@@ -1,0 +1,8 @@
+// pico-gamepad: game controllers for Pico (Linux first: evdev, read by polling the kernel's state; macOS and Windows follow behind
+// the same API). A pad is listed without being opened, opened read-only, and asked what it says NOW.
+export { AxisInfo, OpenedPad, PadDevice, PadError, PadEvent, PadInfo, PadState, PadSystem, WatchOptions } from "./types"
+export { Pad, listPads, monotonicUs, openPad } from "./pad"
+export { PadWatch, watchPads } from "./watch"
+export { defaultSystem } from "./system"
+export { normalise } from "./decode"
+export { FakeDevice, FakeSystem, fakeInfo } from "./fake"

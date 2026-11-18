@@ -1,0 +1,229 @@
+// The Linux backend over a made-up /sys and /dev tree and a kernel that answers from canned buffers: what is listed, what is never
+// opened, what a state is, and what an unplugged device does. No hardware, no /dev/input, no privilege.
+import { describe, it, expect } from "std/test"
+import { mkdir, remove, writeText, exists } from "std/fs"
+import { errorOf, LinuxSystem, nodeName } from "./evdev"
+import { eviocgabs, eviocgkey } from "./ioctl"
+import { Pad, listPads, openPad } from "./pad"
+import { PadError, PadInfo } from "./types"
+
+extern "C" {
+  function getpid(): c_int
+}
+
+/// The TX16S's `capabilities/key` (codes 0x130 to 0x13f and 0x2c0 to 0x2c7: 24 buttons), as the kernel prints it.
+const RADIO_KEYS = "ff 0 0 0 0 0 0 ffff000000000000 0 0 0 0"
+
+/// A keyboard's: codes 1 to 120.
+const KEYBOARD_KEYS = "1ffffffffffffff fffffffffffffffe"
+
+/// A made-up kernel: a canned state, and a device that can be unplugged.
+class Kernel {
+  public values: int[] = [1023, 1015, 1022, 1027, 0, 0, 0, 0]
+  public pressed: int[] = []
+  public gone: bool = false
+  public calls: int = 0
+
+  /// `ioctl(fd, request, buf)`: the answers of EVIOCGABS(0..7) and EVIOCGKEY, or ENODEV once unplugged.
+  public ask(_fd: int, request: int, buf: Uint8Array): int {
+    calls += 1
+    if (gone) {
+      return -19
+    }
+    for (let code = 0; code < 8; code++) {
+      if (request == eviocgabs(code)) {
+        const v = values[code]
+        buf.set(0, (v & 255) as u8)
+        buf.set(1, ((v >> 8) & 255) as u8)
+        buf.set(4, 0 as u8)
+        buf.set(8, 255 as u8)
+        buf.set(9, 7 as u8)
+        buf.set(12, 7 as u8)
+        buf.set(16, 127 as u8)
+        return 0
+      }
+    }
+    if (request == eviocgkey(96)) {
+      for (const code of pressed) {
+        buf.set(code >> 3, ((buf.get(code >> 3) as int) | (1 << (code & 7))) as u8)
+      }
+      return 0
+    }
+    return -25
+  }
+}
+
+async function input(sysfs: string, name: string, vendor: string, product: string, kind: string, uniq: string, phys: string): Promise<void> throws Error {
+  const dir = `${sysfs}/class/input/${name}/device`
+  await mkdir(`${dir}/id`, true)
+  await mkdir(`${dir}/capabilities`, true)
+  await writeText(`${dir}/id/vendor`, `${vendor}\n`)
+  await writeText(`${dir}/id/product`, `${product}\n`)
+  await writeText(`${dir}/uniq`, `${uniq}\n`)
+  await writeText(`${dir}/phys`, `${phys}\n`)
+  if (kind == "radio") {
+    await writeText(`${dir}/name`, "OpenTX Radiomaster TX16S Joystick\n")
+    await writeText(`${dir}/capabilities/ev`, "b\n")
+    await writeText(`${dir}/capabilities/abs`, "ff\n")
+    await writeText(`${dir}/capabilities/key`, `${RADIO_KEYS}\n`)
+  } else if (kind == "keyboard") {
+    await writeText(`${dir}/name`, "A Keyboard\n")
+    await writeText(`${dir}/capabilities/ev`, "120003\n")
+    await writeText(`${dir}/capabilities/abs`, "0\n")
+    await writeText(`${dir}/capabilities/key`, `${KEYBOARD_KEYS}\n`)
+  }
+}
+
+/// A tree with a keyboard (event3), the radio (event11) and a second node whose device file is missing (event12).
+async function tree(): Promise<string> throws Error {
+  const root = `/tmp/pico-gamepad-${getpid()}`
+  if (await exists(root)) {
+    await remove(root, true)
+  }
+  const sysfs = `${root}/sys`
+  await mkdir(`${root}/dev/input`, true)
+  await input(sysfs, "event3", "203a", "fffb", "keyboard", "", "isa0060/serio0/input0")
+  await input(sysfs, "event11", "1209", "4f54", "radio", "00000000001B", "usb-0000:00:03.0-2.1/input0")
+  await input(sysfs, "event12", "1209", "4f54", "radio", "00000000001C", "usb-0000:00:03.0-2.2/input0")
+  await writeText(`${root}/dev/input/event3`, "")
+  await writeText(`${root}/dev/input/event11`, "")
+  await writeText(`${root}/dev/input/js1`, "")
+  return root
+}
+
+async function onlyJoysticksAreListed(): Promise<void> throws Error {
+  const root = await tree()
+  const kernel = new Kernel()
+  const system = new LinuxSystem(`${root}/sys`, `${root}/dev`, (fd: int, r: int, b: Uint8Array) => kernel.ask(fd, r, b))
+  const pads = await listPads(system)
+  await remove(root, true)
+  // (the keyboard is not listed; event12 is in sysfs but has no node in /dev: only what /dev has is listed)
+  expect(pads.map((p: PadInfo) => p.path).join(",")).toBe(`${root}/dev/input/event11`)
+  const radio = pads[0]
+  expect(radio.id).toBe("1209:4f54#00000000001B")
+  expect(radio.legacyId).toBe("OpenTX Radiomaster TX16S Joystick (Vendor: 1209 Product: 4f54)")
+  expect(`${radio.name} ${radio.source} ${radio.uniq} ${radio.phys}`).toBe("OpenTX Radiomaster TX16S Joystick evdev 00000000001B usb-0000:00:03.0-2.1/input0")
+  expect(radio.axisCodes.join(",")).toBe("0,1,2,3,4,5,6,7")
+  expect(radio.buttonCodes.length).toBe(24)
+  expect(`0x${radio.buttonCodes[0].toString()} ${radio.buttonCodes[15]} ${radio.buttonCodes[16]} ${radio.buttonCodes[23]}`).toBe("0x304 319 704 711")
+  expect(kernel.calls).toBe(0)
+}
+
+async function aKeyboardIsNeverOpened(): Promise<void> throws Error {
+  const root = await tree()
+  const kernel = new Kernel()
+  const system = new LinuxSystem(`${root}/sys`, `${root}/dev`, (fd: int, r: int, b: Uint8Array) => kernel.ask(fd, r, b))
+  const info: PadInfo = {
+    id: "x", legacyId: "x", name: "A Keyboard", vendor: 0x203a, product: 0xfffb, uniq: "", phys: "", path: `${root}/dev/input/event3`,
+    source: "evdev", axisCodes: [0, 1], buttonCodes: [0x130],
+  }
+  let code = "none"
+  try {
+    await openPad(info, system)
+  } catch (e: PadError) {
+    code = e.code
+  }
+  await remove(root, true)
+  expect(code).toBe("NOT_A_PAD")
+  expect(kernel.calls).toBe(0)
+}
+
+async function aPadIsReadByAskingTheKernelItsStateNow(): Promise<void> throws Error {
+  const root = await tree()
+  const kernel = new Kernel()
+  const system = new LinuxSystem(`${root}/sys`, `${root}/dev`, (fd: int, r: int, b: Uint8Array) => kernel.ask(fd, r, b))
+  const pad: Pad = await openPad((await listPads(system))[0], system)
+  expect(pad.axes.length).toBe(8)
+  expect(`${pad.axes[4].name} ${pad.axes[4].minimum}..${pad.axes[4].maximum} flat ${pad.axes[4].flat} fuzz ${pad.axes[4].fuzz}`).toBe("ABS_RY 0..2047 flat 127 fuzz 7")
+  const rest = pad.state()
+  expect(rest.raw.join(",")).toBe("1023,1015,1022,1027,0,0,0,0")
+  expect(Math.round(rest.axes[0] * 1000.0)).toBe(0)
+  expect(Math.round(rest.axes[7] * 1000.0)).toBe(-1000)
+  expect(rest.buttons.filter((b: bool) => b).length).toBe(0)
+  // axes 4 and 7 to their ends (the ones the browser never shows), and buttons 0 and 16 down (codes 0x130 and 0x2c0)
+  kernel.values[4] = 2047
+  kernel.values[7] = 2047
+  kernel.pressed.push(0x130)
+  kernel.pressed.push(0x2c0)
+  const moved = pad.state()
+  expect(`${moved.raw[4]} ${moved.raw[7]} ${Math.round(moved.axes[4] * 1000.0)}`).toBe("2047 2047 1000")
+  expect(`${moved.buttons[0]} ${moved.buttons[1]} ${moved.buttons[16]} ${moved.buttons[15]}`).toBe("true false true false")
+  pad.close()
+  await remove(root, true)
+}
+
+async function anUnpluggedPadIsDisconnectedAtTheNextRead(): Promise<void> throws Error {
+  const root = await tree()
+  const kernel = new Kernel()
+  const system = new LinuxSystem(`${root}/sys`, `${root}/dev`, (fd: int, r: int, b: Uint8Array) => kernel.ask(fd, r, b))
+  const pad: Pad = await openPad((await listPads(system))[0], system)
+  expect(pad.state().raw.length).toBe(8)
+  kernel.gone = true
+  let code = "none"
+  let errno = 0
+  try {
+    pad.state()
+  } catch (e: PadError) {
+    code = e.code
+    errno = e.errno
+  }
+  pad.close()
+  await remove(root, true)
+  expect(`${code} ${errno}`).toBe("DISCONNECTED 19")
+}
+
+async function aNodeThatIsGoneIsNotFound(): Promise<void> throws Error {
+  const root = await tree()
+  const kernel = new Kernel()
+  const system = new LinuxSystem(`${root}/sys`, `${root}/dev`, (fd: int, r: int, b: Uint8Array) => kernel.ask(fd, r, b))
+  const info = (await listPads(system))[0]
+  // (unplugged between the listing and the open: the node is gone)
+  await remove(info.path)
+  let code = "none"
+  try {
+    await openPad(info, system)
+  } catch (e: PadError) {
+    code = e.code
+  }
+  await remove(root, true)
+  expect(code).toBe("NOT_FOUND")
+}
+
+async function nothingIsFoundWithoutSysfsOrDev(): Promise<void> throws Error {
+  expect((await listPads(new LinuxSystem("/nonexistent/sys", "/nonexistent/dev"))).length).toBe(0)
+}
+
+function errnosBecomeCodes(): void {
+  expect(errorOf("open", -13).code).toBe("PERMISSION_DENIED")
+  expect(errorOf("open", -1).code).toBe("PERMISSION_DENIED")
+  expect(errorOf("open", -2).code).toBe("NOT_FOUND")
+  expect(errorOf("read", -19).code).toBe("DISCONNECTED")
+  expect(errorOf("read", -6).code).toBe("DISCONNECTED")
+  expect(errorOf("read", -9).code).toBe("CLOSED")
+  expect(errorOf("read", -5).code).toBe("IO")
+  expect(errorOf("read", -25).code).toBe("IO")
+  expect(errorOf("open /dev/input/event3", -13).message).toBe("open /dev/input/event3: permission denied (EACCES)")
+  expect(errorOf("read", -19).errno).toBe(19)
+}
+
+function nodeNamesComeFromPaths(): void {
+  expect(nodeName("/dev/input/event11")).toBe("event11")
+  expect(nodeName("event3")).toBe("event3")
+  expect(nodeName("/dev/input/js1")).toBe("")
+  expect(nodeName("/dev/input/event")).toBe("")
+  expect(nodeName("/dev/ttyUSB0")).toBe("")
+}
+
+describe("the Linux backend over a made-up tree", () => {
+  it("lists the joysticks only, without opening anything", onlyJoysticksAreListed)
+  it("never opens a keyboard, whatever it is asked", aKeyboardIsNeverOpened)
+  it("reads a pad by asking the kernel its state now", aPadIsReadByAskingTheKernelItsStateNow)
+  it("says DISCONNECTED at the next read once the device is gone", anUnpluggedPadIsDisconnectedAtTheNextRead)
+  it("says NOT_FOUND for a device file that is not there", aNodeThatIsGoneIsNotFound)
+  it("finds nothing without sysfs or /dev", nothingIsFoundWithoutSysfsOrDev)
+})
+
+describe("the errors", () => {
+  it("are codes made of errnos", errnosBecomeCodes)
+  it("tell the event node from a path", nodeNamesComeFromPaths)
+})

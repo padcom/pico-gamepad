@@ -1,0 +1,117 @@
+// G0 spike: what the probes share: the command line, the clock, the list of nodes (js* too), and the lines of the report.
+import { readDir } from "std/fs"
+import { Sysfs, isDigits, numberAfter, parseHex, readOr, sysfsOf as sysfsOfNode } from "../sysfs"
+import { fixed } from "./format"
+
+export { isDigits, numberAfter, parseHex, readOr }
+
+/// What was asked for on the command line.
+export class Options {
+  public seconds: int = 10
+  public hz: int = 50
+  public joydev: bool = false
+  public watchSeconds: int = 0
+  public device: string = ""
+  public problem: string = ""
+}
+
+/// Reads the command line: `--seconds N`, `--hz N`, `--joydev`, `--watch N`, `--device PATH`. What is wrong with it is said in `problem`.
+export function parseOptions(argv: string[]): Options {
+  const o = new Options()
+  let i = 0
+  while (i < argv.length) {
+    const a = argv[i]
+    const next = if (i + 1 < argv.length) argv[i + 1] else ""
+    if (a == "--joydev") {
+      o.joydev = true
+    } else if (a == "--seconds" || a == "--hz" || a == "--watch") {
+      const n = if (isDigits(next)) parseInt(next) else 0
+      if (n <= 0 || n > 600) {
+        o.problem = `${a} wants a number of 1 to 600`
+      } else if (a == "--seconds") {
+        o.seconds = n
+      } else if (a == "--hz") {
+        o.hz = n
+      } else {
+        o.watchSeconds = n
+      }
+      i += 1
+    } else if (a == "--device") {
+      if (next == "") {
+        o.problem = "--device wants a path"
+      }
+      o.device = next
+      i += 1
+    } else {
+      o.problem = `what is ${a}?`
+    }
+    i += 1
+  }
+  return o
+}
+
+/// Microseconds on the monotonic clock (`performance.now()`: the runtime's `__monoNanos`, counted from the program's start).
+export function nowUs(): int {
+  return (performance.now() * 1000.0) as int
+}
+
+/// A section's title.
+export function heading(title: string): void {
+  println("")
+  println(`== ${title}`)
+}
+
+/// `x` with its sign and two decimals.
+export function signed(x: f64): string {
+  return if (x >= 0.0) `+${fixed(x, 2)}` else fixed(x, 2)
+}
+
+/// Microseconds as milliseconds with a decimal.
+export function ms(us: int): string {
+  return fixed((us as f64) / 1000.0, 1)
+}
+
+/// A node of /dev/input.
+export class Node {
+  public name: string = ""
+  public path: string = ""
+  public isEvent: bool = false
+  public number: int = 0
+  public kind: string = ""
+  public opened: bool = false
+}
+
+/// The `event*` and `js*` nodes of /dev/input, events first, each group in number order.
+export async function nodesOf(): Promise<Node[]> {
+  const events: Node[] = []
+  const sticks: Node[] = []
+  try {
+    for await (const e of readDir("/dev/input")) {
+      const ev = numberAfter(e.name, "event")
+      const js = numberAfter(e.name, "js")
+      if (ev >= 0 || js >= 0) {
+        const node = new Node()
+        node.name = e.name
+        node.path = `/dev/input/${e.name}`
+        node.isEvent = ev >= 0
+        node.number = if (ev >= 0) ev else js
+        if (ev >= 0) {
+          events.push(node)
+        } else {
+          sticks.push(node)
+        }
+      }
+    }
+  } catch (e: Error) {
+    println(`cannot list /dev/input: ${e.message}`)
+  }
+  events.sort((a: Node, b: Node) => a.number - b.number)
+  sticks.sort((a: Node, b: Node) => a.number - b.number)
+  return events.concat(sticks)
+}
+
+/// What sysfs says of a node, without opening it (`/sys/class/input/<node>/device`; for a `js*` node that is the same input device its
+/// event node has).
+export async function sysfsOf(node: Node): Promise<Sysfs> {
+  return await sysfsOfNode("/sys", node.name, node.isEvent)
+}

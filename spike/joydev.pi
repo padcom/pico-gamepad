@@ -1,0 +1,260 @@
+// G0 spike, the other way in: joydev (/dev/input/js*), which has no "state now" call, only the event stream (the state at open comes as
+// JS_EVENT_INIT events), and the watch of /dev/input for a node that appears (how long after it does open() works: the udev ACL).
+// NOTE: the joydev part (section 7 and 8) was NOT run on a real device (it is the fallback, if evdev is not accessible); the watch
+// (section 9) was, and showed the ACL coming 264 ms after the node.
+import { delay } from "std/timers"
+import {
+  JS_EVENT_AXIS, JS_EVENT_BUTTON, JS_EVENT_BYTES, JS_EVENT_INIT, absName, hex, jsiocgaxes, jsiocgaxmap, jsiocgbtnmap, jsiocgbuttons,
+  jsiocgname, jsiocgversion, keyName,
+} from "../ioctl"
+import { cText, errnoName, joydevButtonOrder, normalise, u16At, u32At } from "../decode"
+import { ask, closeFd, describe, openRead, readInto } from "../posix"
+import { fixed, parseJsEvent } from "./format"
+import { Node, heading, ms, nodesOf, nowUs, signed, sysfsOf } from "./report"
+
+/// Section 7: joydev's answers for a js node, its initial state, and the events for `seconds`.
+export async function probeJoydev(node: Node, seconds: int): Promise<void> throws Error {
+  heading(`7. joydev ${node.path}: JSIOCG*, JS_EVENT_INIT and the event stream (MOVE EVERY STICK TO ITS ENDS NOW)`)
+  const fd = openRead(node.path)
+  if (fd < 0) {
+    println(`open ${node.path} FAILED: ${errnoName(-fd)} (${describe(-fd)})`)
+    return
+  }
+  const version = new Uint8Array(4)
+  const axesBuf = new Uint8Array(1)
+  const buttonsBuf = new Uint8Array(1)
+  const nameBuf = new Uint8Array(128)
+  ask(fd, jsiocgversion(), version)
+  ask(fd, jsiocgaxes(), axesBuf)
+  ask(fd, jsiocgbuttons(), buttonsBuf)
+  ask(fd, jsiocgname(128), nameBuf)
+  const axes = axesBuf.get(0) as int
+  const buttons = buttonsBuf.get(0) as int
+  println(`name "${cText(nameBuf)}"  driver version 0x${hex(u32At(version, 0), 6)}  axes ${axes}  buttons ${buttons}`)
+  await compareMaps(node, fd, axes, buttons)
+  const state = new State(axes, buttons)
+  drain(fd, state)
+  println(`state at open (JS_EVENT_INIT, ${state.events} events): axes ${state.values.join(",")}  buttons pressed [${state.pressed().join(",")}]`)
+  await stream(fd, state, seconds)
+  closeFd(fd)
+}
+
+/// What joydev says of the axes and buttons: their numbers and the codes they stand for, against what sysfs lists for the same device.
+async function compareMaps(node: Node, fd: int, axes: int, buttons: int): Promise<void> {
+  const axmap = new Uint8Array(64)
+  const btnmap = new Uint8Array(1024)
+  ask(fd, jsiocgaxmap(), axmap)
+  ask(fd, jsiocgbtnmap(), btnmap)
+  const axisCodes: int[] = []
+  for (let i = 0; i < axes; i++) {
+    axisCodes.push(axmap.get(i) as int)
+  }
+  const buttonCodes: int[] = []
+  for (let i = 0; i < buttons; i++) {
+    buttonCodes.push(u16At(btnmap, i * 2))
+  }
+  const axisNames: string[] = []
+  for (let i = 0; i < axisCodes.length; i++) {
+    axisNames.push(`${i}=${absName(axisCodes[i])}`)
+  }
+  const buttonNames: string[] = []
+  for (let i = 0; i < buttonCodes.length; i++) {
+    buttonNames.push(`${i}=${keyName(buttonCodes[i])}`)
+  }
+  println(`  JSIOCGAXMAP:  ${axisNames.join(" ")}`)
+  println(`  JSIOCGBTNMAP: ${buttonNames.join(" ")}`)
+  const sys = await sysfsOf(node)
+  println(`  sysfs axes (ascending): ${sys.abs.join(",")}  JSIOCGAXMAP: ${axisCodes.join(",")}  same: ${sys.abs.join(",") == axisCodes.join(",")}`)
+  const computed = joydevButtonOrder(sys.keys)
+  println(`  sysfs buttons in joydev order: ${computed.join(",")}`)
+  println(`  JSIOCGBTNMAP:                  ${buttonCodes.join(",")}  same: ${computed.join(",") == buttonCodes.join(",")}`)
+}
+
+/// What the events say: the value of every axis, which buttons are down, the extremes and the counts.
+class State {
+  public values: int[] = []
+  public lows: int[] = []
+  public highs: int[] = []
+  public down: bool[] = []
+  public downEvents: int[] = []
+  public events: int = 0
+  public ended: string = ""
+
+  constructor(axes: int, buttons: int) {
+    for (let i = 0; i < axes; i++) {
+      this.values.push(0)
+      this.lows.push(32767)
+      this.highs.push(-32767)
+    }
+    for (let i = 0; i < buttons; i++) {
+      this.down.push(false)
+      this.downEvents.push(0)
+    }
+  }
+
+  public pressed(): int[] {
+    const out: int[] = []
+    for (let i = 0; i < down.length; i++) {
+      if (down[i]) {
+        out.push(i)
+      }
+    }
+    return out
+  }
+}
+
+/// Reads what is there (not waiting): the events into `state`. Returns false when the read failed for good (`state.ended` says why).
+function drain(fd: int, state: State): bool {
+  const buf = new Uint8Array(JS_EVENT_BYTES * 64)
+  let more = true
+  let ok = true
+  while (more) {
+    const r = readInto(fd, buf)
+    if (r == -11) {
+      more = false
+    } else if (r < 0) {
+      state.ended = `read FAILED: ${errnoName(-r)} (${describe(-r)})`
+      more = false
+      ok = false
+    } else if (r == 0) {
+      state.ended = "read returned 0 (end of file)"
+      more = false
+      ok = false
+    } else {
+      for (let at = 0; at + JS_EVENT_BYTES <= r; at += JS_EVENT_BYTES) {
+        const e = parseJsEvent(buf, at)
+        if (e != null) {
+          apply(state, e!.kind & ~JS_EVENT_INIT, e!.number, e!.value)
+        }
+      }
+    }
+  }
+  return ok
+}
+
+function apply(state: State, kind: int, number: int, value: int): void {
+  state.events += 1
+  if (kind == JS_EVENT_AXIS && number < state.values.length) {
+    state.values[number] = value
+    if (value < state.lows[number]) {
+      state.lows[number] = value
+    }
+    if (value > state.highs[number]) {
+      state.highs[number] = value
+    }
+  } else if (kind == JS_EVENT_BUTTON && number < state.down.length) {
+    state.down[number] = value != 0
+    if (value != 0) {
+      state.downEvents[number] += 1
+    }
+  }
+}
+
+/// Reads the stream for `seconds` (every 20 ms, not waiting), prints a line every quarter second and the summary.
+async function stream(fd: int, state: State, seconds: int): Promise<void> throws Error {
+  const start = nowUs()
+  let tick = 0
+  while (nowUs() - start < seconds * 1000000) {
+    if (!drain(fd, state)) {
+      break
+    }
+    if (tick % 12 == 0) {
+      const parts: string[] = []
+      for (const v of state.values) {
+        parts.push(signed(normalise(v, -32767, 32767)))
+      }
+      println(`t ${fixed(((nowUs() - start) as f64) / 1000000.0, 2)} s  axes ${parts.join(" ")}  pressed [${state.pressed().join(",")}]`)
+    }
+    tick += 1
+    await delay(20)
+  }
+  heading("8. what the joydev stream showed")
+  println(`  events after the initial state: ${state.events}`)
+  for (let i = 0; i < state.values.length; i++) {
+    const moved = state.highs[i] - state.lows[i]
+    const verdict = if (state.highs[i] < state.lows[i]) "NO EVENT" else if (moved >= 58000) "reached both ends" else "moved"
+    println(`  axis ${i}  seen ${state.lows[i]}..${state.highs[i]}  ${verdict}`)
+  }
+  const used: string[] = []
+  for (let b = 0; b < state.down.length; b++) {
+    if (state.downEvents[b] > 0) {
+      used.push(`${b} x${state.downEvents[b]}`)
+    }
+  }
+  println(`  buttons pressed: ${if (used.length == 0) "none" else used.join(", ")}`)
+  if (state.ended != "") {
+    println(`  ENDED: ${state.ended}`)
+  }
+}
+
+/// Section 9: watches /dev/input every 100 ms for `seconds`: a node that appears or goes, and for one that appears how long it takes
+/// before open() works (the udev ACL may come after the node).
+export async function watchNodes(seconds: int): Promise<void> throws Error {
+  heading(`9. watching /dev/input for ${seconds} s (plug the radio in, and out): the nodes that appear, and when open() works`)
+  const start = nowUs()
+  let known: string[] = []
+  for (const n of await nodesOf()) {
+    known.push(n.name)
+  }
+  println(`at the start: ${known.join(" ")}`)
+  const waiting: string[] = []
+  const since: int[] = []
+  while (nowUs() - start < seconds * 1000000) {
+    await delay(100)
+    const now: Node[] = await nodesOf()
+    const names: string[] = now.map((n: Node) => n.name)
+    for (const node of now) {
+      if (!known.includes(node.name)) {
+        println(`+ ${node.name} appeared at ${ms(nowUs() - start)} ms`)
+        tryOpen(node, waiting, since, 0)
+      }
+    }
+    for (const name of known) {
+      if (!names.includes(name)) {
+        println(`- ${name} went at ${ms(nowUs() - start)} ms`)
+      }
+    }
+    known = names
+    retry(now, waiting, since)
+  }
+  println("(a node that is not a joystick is only opened to see whether it can be, and closed)")
+}
+
+/// Tries to open a node that just appeared; one that fails is kept to be tried again.
+function tryOpen(node: Node, waiting: string[], since: int[], after: int): void {
+  const fd = openRead(node.path)
+  if (fd >= 0) {
+    println(`  ${node.name}: open OK ${if (after == 0) "at once" else `${ms(after)} ms after it appeared`}`)
+    closeFd(fd)
+    return
+  }
+  if (after == 0) {
+    println(`  ${node.name}: open FAILED at once: ${errnoName(-fd)} (${describe(-fd)}); trying again every 100 ms for 5 s`)
+    waiting.push(node.name)
+    since.push(nowUs())
+  }
+}
+
+/// Tries again the nodes whose open() failed, until it works or 5 s have passed.
+function retry(now: Node[], waiting: string[], since: int[]): void {
+  for (let i = waiting.length - 1; i >= 0; i--) {
+    const node = now.find((n: Node) => n.name == waiting[i])
+    const after = nowUs() - since[i]
+    if (node == null) {
+      waiting.splice(i, 1)
+      since.splice(i, 1)
+      continue
+    }
+    const fd = openRead(node!.path)
+    if (fd >= 0) {
+      println(`  ${waiting[i]}: open OK ${ms(after)} ms after it appeared (the permission came later than the node)`)
+      closeFd(fd)
+    } else if (after < 5000000) {
+      continue
+    } else {
+      println(`  ${waiting[i]}: still ${errnoName(-fd)} after ${ms(after)} ms: no access`)
+    }
+    waiting.splice(i, 1)
+    since.splice(i, 1)
+  }
+}
