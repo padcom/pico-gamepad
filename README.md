@@ -26,7 +26,7 @@ pad.close()
   - `id`: `vendor:product` (4 hex digits each), `#serial` when the device has one, `@port` when two pads would otherwise be the same: no two pads share an id.
   - `legacyId`: the string a browser gives the pad (`name (Vendor: 1209 Product: 4f54)`), for a mapping that was saved by the browser.
   - `axisCodes` / `buttonCodes`: what the pad has, in the order it numbers them.
-- `openPad(info, system?)` opens a pad read only. It throws `PadError`: `PERMISSION_DENIED`, `NOT_FOUND`, `NOT_A_PAD`, `UNSUPPORTED`, `IO`.
+- `openPad(info, system?)` opens a pad read only. It throws `PadError` (with the `errno` of the call that failed, when there was one): `PERMISSION_DENIED`, `NOT_FOUND`, `NOT_A_PAD` (not a joystick, or codes that are not codes), `CHANGED` (another device is behind the node than the one that was listed), `UNSUPPORTED`, `IO`. `Pad.state()` throws `DISCONNECTED` and `CLOSED`.
 - `Pad.state()` reads the pad **now** (it throws `DISCONNECTED` at the very next read after an unplug, and `CLOSED` after `close()`):
   - `raw`: every axis as the device reports it; `axes`: the same from -1 to 1 by the range the device declares (**nothing is calibrated**: the device's own range is the range; its dead zone and noise filter are reported in `Pad.axes` and not applied);
   - `buttons`: which are down;

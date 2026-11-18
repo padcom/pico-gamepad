@@ -52,16 +52,18 @@ export class LinuxDevice implements PadDevice {
   readonly axisCodes: int[]
   readonly buttonCodes: int[]
   readonly ioctl: Ioctl
+  readonly closer: Closer
   readonly one: Uint8Array = new Uint8Array(ABSINFO_BYTES)
   readonly keys: Uint8Array = new Uint8Array(KEY_MAX / 8 + 1)
   closed: bool = false
 
-  constructor(fd: int, path: string, axisCodes: int[], buttonCodes: int[], ioctl: Ioctl) {
+  constructor(fd: int, path: string, axisCodes: int[], buttonCodes: int[], ioctl: Ioctl, closer: Closer = closeFd) {
     this.fd = fd
     this.path = path
     this.axisCodes = axisCodes
     this.buttonCodes = buttonCodes
     this.ioctl = ioctl
+    this.closer = closer
   }
 
   public rawAxes(): int[] throws PadError {
@@ -95,7 +97,8 @@ export class LinuxDevice implements PadDevice {
   public close(): void {
     if (!closed) {
       closed = true
-      closeFd(fd)
+      const release = this.closer
+      release(fd)
     }
   }
 
@@ -106,16 +109,26 @@ export class LinuxDevice implements PadDevice {
   }
 }
 
-/// The pads of a Linux machine. `sysfs` and `dev` are for tests (a made-up tree), `ioctl` for tests too (canned answers).
+/// What opens a node (the descriptor, or the errno as a NEGATIVE number) and what lets go of a descriptor: the system's, or (in a test) ones
+/// that keep a table of the descriptors they hand out and take back.
+export type Opener = (path: string) => int
+export type Closer = (fd: int) => void
+
+/// The pads of a Linux machine. `sysfs` and `dev` are for tests (a made-up tree), `ioctl` for tests too (canned answers), and so are the
+/// `opener` and the `closer` (a table of descriptors, to see that every one that was opened is let go of).
 export class LinuxSystem implements PadSystem {
   readonly sysfs: string
   readonly dev: string
   readonly ioctl: Ioctl
+  readonly opener: Opener
+  readonly closer: Closer
 
-  constructor(sysfs: string = "/sys", dev: string = "/dev", ioctl: Ioctl = ask) {
+  constructor(sysfs: string = "/sys", dev: string = "/dev", ioctl: Ioctl = ask, opener: Opener = openRead, closer: Closer = closeFd) {
     this.sysfs = sysfs
     this.dev = dev
     this.ioctl = ioctl
+    this.opener = opener
+    this.closer = closer
   }
 
   /// The joysticks among the event nodes, by what sysfs says of them: no node is opened, and only a joystick is listed.
@@ -174,14 +187,16 @@ export class LinuxSystem implements PadSystem {
     if (sys.kind != "joystick") {
       throw new PadError("NOT_A_PAD", `${info.path} is not a joystick (it is a ${sys.kind}): not opened`)
     }
-    const fd = openRead(info.path)
+    const opener = this.opener
+    const release = this.closer
+    const fd = opener(info.path)
     if (fd < 0) {
       throw errorOf(`open ${info.path}`, fd)
     }
     const ask = this.ioctl
     const wrong = whoIsThere(fd, info, ask)
     if (wrong != null) {
-      closeFd(fd)
+      release(fd)
       throw wrong!
     }
     const axes: AxisInfo[] = []
@@ -190,13 +205,13 @@ export class LinuxSystem implements PadSystem {
       const buf = new Uint8Array(ABSINFO_BYTES)
       const r = ask(fd, eviocgabs(code), buf)
       if (r < 0) {
-        closeFd(fd)
+        release(fd)
         throw errorOf(`${info.path}: EVIOCGABS(${absName(code)})`, r)
       }
       const a = parseAbsInfo(buf)
       axes.push({ index: i, code: code, name: absName(code), minimum: a.minimum, maximum: a.maximum, flat: a.flat, fuzz: a.fuzz })
     }
-    return { axes: axes, device: new LinuxDevice(fd, info.path, info.axisCodes, info.buttonCodes, ioctl) }
+    return { axes: axes, device: new LinuxDevice(fd, info.path, info.axisCodes, info.buttonCodes, ioctl, release) }
   }
 }
 

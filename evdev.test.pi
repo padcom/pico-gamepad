@@ -39,6 +39,8 @@ class Kernel {
   public name: string = "OpenTX Radiomaster TX16S Joystick"
   /// Whether what is behind the node is a keyboard now.
   public keyboard: bool = false
+  /// Whether reading an axis fails (EIO).
+  public failAbs: bool = false
 
   /// The answers that say what a device is: its id, its name and its capabilities (never what is pressed).
   askWhoItIs(request: int, buf: Uint8Array): int {
@@ -89,6 +91,9 @@ class Kernel {
     }
     for (let code = 0; code < 8; code++) {
       if (request == eviocgabs(code)) {
+        if (failAbs) {
+          return -5
+        }
         stateCalls += 1
         const v = values[code]
         buf.set(0, (v & 255) as u8)
@@ -270,6 +275,71 @@ async function aNodeThatChangedIdentityBetweenTheListingAndTheOpenIsLetGo(): Pro
   expect(await openAfter((_k: Kernel) => {})).toBe("ok 8")
 }
 
+/// A table of descriptors: the ones handed out and the ones taken back.
+class Descriptors {
+  public opened: int[] = []
+  public closed: int[] = []
+  next: int = 100
+
+  public open(_path: string): int {
+    const fd = next
+    next += 1
+    opened.push(fd)
+    return fd
+  }
+
+  public close(fd: int): void {
+    closed.push(fd)
+  }
+
+  /// How many were handed out and how many taken back, and whether every one that was handed out was taken back exactly once.
+  public report(): string {
+    const back = this.closed.slice(0).sort()
+    const out = this.opened.slice(0).sort()
+    return `${opened.length} ${closed.length} ${back.join(",") == out.join(",")}`
+  }
+}
+
+/// How the descriptors went when the listed radio is opened after `change` was made to the kernel, and then closed if it opened.
+async function descriptorsAfter(change: (kernel: Kernel) => void): Promise<string> throws Error {
+  const root = await tree()
+  const kernel = new Kernel()
+  const table = new Descriptors()
+  const system = new LinuxSystem(
+    `${root}/sys`, `${root}/dev`, (fd: int, r: int, b: Uint8Array) => kernel.ask(fd, r, b),
+    (path: string) => table.open(path), (fd: int) => table.close(fd),
+  )
+  const info = (await listPads(system))[0]
+  change(kernel)
+  let reached = ""
+  try {
+    const pad = await openPad(info, system)
+    reached = `open ${table.report()}`
+    pad.close()
+    pad.close()
+  } catch (e: PadError) {
+    reached = e.code
+  }
+  await remove(root, true)
+  return `${reached}: ${table.report()}`
+}
+
+async function everyDescriptorThatIsOpenedIsLetGoOf(): Promise<void> throws Error {
+  // another device behind the node (CHANGED), a keyboard's capabilities (NOT_A_PAD), a failing read of an axis (IO): the one descriptor
+  // that was opened is closed, once
+  expect(await descriptorsAfter((k: Kernel) => {
+    k.vendor = 0x203a
+  })).toBe("CHANGED: 1 1 true")
+  expect(await descriptorsAfter((k: Kernel) => {
+    k.keyboard = true
+  })).toBe("NOT_A_PAD: 1 1 true")
+  expect(await descriptorsAfter((k: Kernel) => {
+    k.failAbs = true
+  })).toBe("IO: 1 1 true")
+  // an open that works holds its descriptor until close(), which lets go of it once, however often it is called
+  expect(await descriptorsAfter((_k: Kernel) => {})).toBe("open 1 0 false: 1 1 true")
+}
+
 async function codesThatAreNotCodesAreRefusedBeforeAnythingIsOpened(): Promise<void> throws Error {
   const root = await tree()
   const kernel = new Kernel()
@@ -346,6 +416,7 @@ describe("the Linux backend over a made-up tree", () => {
   it("reads a pad by asking the kernel its state now", aPadIsReadByAskingTheKernelItsStateNow)
   it("says DISCONNECTED at the next read once the device is gone", anUnpluggedPadIsDisconnectedAtTheNextRead)
   it("lets go of a node that is another device by the time it is open, asking only who it is", aNodeThatChangedIdentityBetweenTheListingAndTheOpenIsLetGo)
+  it("lets go of every descriptor it opened: after a mismatch, a failing read, and close()", everyDescriptorThatIsOpenedIsLetGoOf)
   it("refuses codes that are not codes before anything is opened", codesThatAreNotCodesAreRefusedBeforeAnythingIsOpened)
   it("says NOT_FOUND for a device file that is not there", aNodeThatIsGoneIsNotFound)
   it("finds nothing without sysfs or /dev", nothingIsFoundWithoutSysfsOrDev)
