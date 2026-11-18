@@ -3,7 +3,7 @@
 import { describe, it, expect } from "std/test"
 import { mkdir, remove, writeText, exists } from "std/fs"
 import { errorOf, LinuxSystem, nodeName } from "./evdev"
-import { eviocgabs, eviocgkey } from "./ioctl"
+import { eviocgabs, eviocgbit, eviocgid, eviocgkey, eviocgname } from "./ioctl"
 import { Pad, listPads, openPad } from "./pad"
 import { PadError, PadInfo } from "./types"
 
@@ -17,21 +17,79 @@ const RADIO_KEYS = "ff 0 0 0 0 0 0 ffff000000000000 0 0 0 0"
 /// A keyboard's: codes 1 to 120.
 const KEYBOARD_KEYS = "1ffffffffffffff fffffffffffffffe"
 
+function range(from: int, to: int): int[] {
+  const out: int[] = []
+  for (let i = from; i <= to; i++) {
+    out.push(i)
+  }
+  return out
+}
+
 /// A made-up kernel: a canned state, and a device that can be unplugged.
 class Kernel {
   public values: int[] = [1023, 1015, 1022, 1027, 0, 0, 0, 0]
   public pressed: int[] = []
   public gone: bool = false
+  /// How many ioctls were made, and how many of them asked for a STATE (an axis' value, the pressed keys).
   public calls: int = 0
+  public stateCalls: int = 0
+  /// Who is behind the node: the radio's id and name, or (a device that took its number) another.
+  public vendor: int = 0x1209
+  public product: int = 0x4f54
+  public name: string = "OpenTX Radiomaster TX16S Joystick"
+  /// Whether what is behind the node is a keyboard now.
+  public keyboard: bool = false
 
-  /// `ioctl(fd, request, buf)`: the answers of EVIOCGABS(0..7) and EVIOCGKEY, or ENODEV once unplugged.
+  /// The answers that say what a device is: its id, its name and its capabilities (never what is pressed).
+  askWhoItIs(request: int, buf: Uint8Array): int {
+    if (request == eviocgid()) {
+      buf.set(0, 3 as u8)
+      buf.set(2, (vendor & 255) as u8)
+      buf.set(3, ((vendor >> 8) & 255) as u8)
+      buf.set(4, (product & 255) as u8)
+      buf.set(5, ((product >> 8) & 255) as u8)
+      return 0
+    }
+    if (request == eviocgname(256)) {
+      const text = new TextEncoder().encode(name)
+      for (let i = 0; i < text.length; i++) {
+        buf.set(i, text.get(i))
+      }
+      return 0
+    }
+    if (request == eviocgbit(0, 4)) {
+      // EV_SYN, EV_KEY and EV_ABS for a radio; EV_SYN and EV_KEY for a keyboard
+      buf.set(0, (if (keyboard) 3 else 11) as u8)
+      return 0
+    }
+    if (request == eviocgbit(3, 8)) {
+      buf.set(0, (if (keyboard) 0 else 255) as u8)
+      return 0
+    }
+    if (request == eviocgbit(1, 96)) {
+      // a radio: codes 0x130 to 0x13f and 0x2c0 to 0x2c7; a keyboard: codes 1 to 120
+      const codes = if (keyboard) range(1, 120) else range(0x130, 0x13f).concat(range(0x2c0, 0x2c7))
+      for (const code of codes) {
+        buf.set(code >> 3, ((buf.get(code >> 3) as int) | (1 << (code & 7))) as u8)
+      }
+      return 0
+    }
+    return -25
+  }
+
+  /// `ioctl(fd, request, buf)`: the answers of who it is, EVIOCGABS(0..7) and EVIOCGKEY, or ENODEV once unplugged.
   public ask(_fd: int, request: int, buf: Uint8Array): int {
     calls += 1
     if (gone) {
       return -19
     }
+    const who = askWhoItIs(request, buf)
+    if (who == 0) {
+      return 0
+    }
     for (let code = 0; code < 8; code++) {
       if (request == eviocgabs(code)) {
+        stateCalls += 1
         const v = values[code]
         buf.set(0, (v & 255) as u8)
         buf.set(1, ((v >> 8) & 255) as u8)
@@ -44,6 +102,7 @@ class Kernel {
       }
     }
     if (request == eviocgkey(96)) {
+      stateCalls += 1
       for (const code of pressed) {
         buf.set(code >> 3, ((buf.get(code >> 3) as int) | (1 << (code & 7))) as u8)
       }
@@ -172,6 +231,73 @@ async function anUnpluggedPadIsDisconnectedAtTheNextRead(): Promise<void> throws
   expect(`${code} ${errno}`).toBe("DISCONNECTED 19")
 }
 
+/// What opening the listed radio says when `change` has been made to the kernel between the listing and the open.
+async function openAfter(change: (kernel: Kernel) => void): Promise<string> throws Error {
+  const root = await tree()
+  const kernel = new Kernel()
+  const system = new LinuxSystem(`${root}/sys`, `${root}/dev`, (fd: int, r: int, b: Uint8Array) => kernel.ask(fd, r, b))
+  const info = (await listPads(system))[0]
+  change(kernel)
+  let code = "ok"
+  try {
+    const pad = await openPad(info, system)
+    pad.close()
+  } catch (e: PadError) {
+    code = e.code
+  }
+  await remove(root, true)
+  // (how many times the device was asked for a value: none for a device that was let go of, which was asked only who it is)
+  return `${code} ${kernel.stateCalls}`
+}
+
+async function aNodeThatChangedIdentityBetweenTheListingAndTheOpenIsLetGo(): Promise<void> throws Error {
+  // the kernel hands the lowest free event number to the next device: another device is behind the path now
+  expect(await openAfter((k: Kernel) => {
+    k.vendor = 0x203a
+    k.product = 0xfffb
+    k.name = "A Keyboard"
+    k.keyboard = true
+  })).toBe("CHANGED 0")
+  // the same vendor and product, another name
+  expect(await openAfter((k: Kernel) => {
+    k.name = "Another Radio"
+  })).toBe("CHANGED 0")
+  // the same id and name, but it is not a joystick (what its capabilities say)
+  expect(await openAfter((k: Kernel) => {
+    k.keyboard = true
+  })).toBe("NOT_A_PAD 0")
+  // and when nothing changed, it opens, and the 8 ranges are asked
+  expect(await openAfter((_k: Kernel) => {})).toBe("ok 8")
+}
+
+async function codesThatAreNotCodesAreRefusedBeforeAnythingIsOpened(): Promise<void> throws Error {
+  const root = await tree()
+  const kernel = new Kernel()
+  const system = new LinuxSystem(`${root}/sys`, `${root}/dev`, (fd: int, r: int, b: Uint8Array) => kernel.ask(fd, r, b))
+  const info = (await listPads(system))[0]
+  // (an EVIOCGABS of a code past 0x3f is built in an 8-bit field: it would be another request)
+  expect(await openWithCodes(info, system, [0, 0xc0], [0x130])).toBe("NOT_A_PAD")
+  expect(await openWithCodes(info, system, [0x40], [0x130])).toBe("NOT_A_PAD")
+  expect(await openWithCodes(info, system, [-1], [0x130])).toBe("NOT_A_PAD")
+  expect(await openWithCodes(info, system, [0, 1], [0x300])).toBe("NOT_A_PAD")
+  expect(await openWithCodes(info, system, [0, 1], [-1])).toBe("NOT_A_PAD")
+  expect(kernel.calls).toBe(0)
+  expect(await openWithCodes(info, system, [0, 1, 7], [0, 0x2ff])).toBe("ok")
+  await remove(root, true)
+}
+
+/// The code of what opening a pad made of `info` with these axis and button codes comes to ("ok" when it opens).
+async function openWithCodes(info: PadInfo, system: LinuxSystem, axes: int[], buttons: int[]): Promise<string> throws Error {
+  const made: PadInfo = { ...info, axisCodes: axes, buttonCodes: buttons }
+  try {
+    const pad = await openPad(made, system)
+    pad.close()
+    return "ok"
+  } catch (e: PadError) {
+    return e.code
+  }
+}
+
 async function aNodeThatIsGoneIsNotFound(): Promise<void> throws Error {
   const root = await tree()
   const kernel = new Kernel()
@@ -219,6 +345,8 @@ describe("the Linux backend over a made-up tree", () => {
   it("never opens a keyboard, whatever it is asked", aKeyboardIsNeverOpened)
   it("reads a pad by asking the kernel its state now", aPadIsReadByAskingTheKernelItsStateNow)
   it("says DISCONNECTED at the next read once the device is gone", anUnpluggedPadIsDisconnectedAtTheNextRead)
+  it("lets go of a node that is another device by the time it is open, asking only who it is", aNodeThatChangedIdentityBetweenTheListingAndTheOpenIsLetGo)
+  it("refuses codes that are not codes before anything is opened", codesThatAreNotCodesAreRefusedBeforeAnythingIsOpened)
   it("says NOT_FOUND for a device file that is not there", aNodeThatIsGoneIsNotFound)
   it("finds nothing without sysfs or /dev", nothingIsFoundWithoutSysfsOrDev)
 })

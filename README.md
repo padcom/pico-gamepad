@@ -75,3 +75,6 @@ No hardware, no `/dev/input` and no privilege: canned `ioctl` answers (`EVIOCGAB
 - Linux only so far (evdev). joydev (`/dev/input/js*`) is only in `spike/`, for the case that evdev is not reachable; it was not run on a device.
 - A pad that is frozen but plugged in looks like sticks that do not move (true of every program that reads one).
 - Only `unsigned long` words of 64 bits (a 64-bit kernel) are read from sysfs by default, on a little-endian machine (x86-64, arm64).
+- A device that has no button in the joystick or gamepad range (pedals, a device with only `BTN_MISC` buttons) is not taken for a pad: it is not listed, and `openPad` of it is `NOT_A_PAD`.
+- "No two pads share an id" holds while the pads differ in vendor, product, serial number or port (`phys`, which every USB device has); two identical devices with neither a serial number nor a `phys` would share one.
+- The kernel gives the lowest free event number to the next device, so a node can be another device by the time it is opened: `openPad` asks the open node who it is (id, name, capabilities: never what is pressed) and lets go of it with `CHANGED` (or `NOT_A_PAD`) when it is not the pad that was listed. `watchPads` takes a pad at the same path with another id, serial number or port for a new pad: `removed`, then `added`.

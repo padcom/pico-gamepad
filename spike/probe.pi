@@ -10,7 +10,7 @@ import {
 import {
   AbsInfo, chromiumId, codesOf, cText, errnoName, joydevButtonOrder, normalise, parseAbsInfo, parseId, s32At, testBit,
 } from "../decode"
-import { ask, closeFd, describe, factsOf, getegid, geteuid, groups, openRead } from "../posix"
+import { ask, closeFd, describe, factsOf, getegid, geteuid, groups, openRead } from "./sys"
 import { bar, fixed, modeText, tickStats } from "./format"
 import { Node, heading, ms, nowUs, readOr, signed, sysfsOf } from "./report"
 

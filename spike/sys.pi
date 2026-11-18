@@ -1,0 +1,66 @@
+// G0 spike: the C calls only the probe needs (the package does not): `read` (joydev's event stream), `statx` (a node's mode and owner)
+// and who the process is. The calls the package itself makes (open, ioctl, errno) are in ../posix.pi.
+import { addr, errno } from "../posix"
+
+export { addr, ask, closeFd, describe, errno, openRead } from "../posix"
+
+export extern "C" {
+  function read(fd: c_int, buf: usize, count: usize): isize
+  function statx(dirfd: c_int, path: string, flags: c_int, mask: c_uint, buf: usize): c_int
+  function geteuid(): c_uint
+  function getegid(): c_uint
+  function getgroups(size: c_int, list: usize): c_int
+}
+
+/// A `read` into `buf`: the number of bytes, or the errno as a NEGATIVE number (EAGAIN: nothing to read yet).
+export function readInto(fd: int, buf: Uint8Array): int {
+  const r = read(fd as c_int, addr(buf), buf.length as usize) as int
+  if (r < 0) {
+    return -errno()
+  }
+  return r
+}
+
+/// What `statx` says of a path: its mode, owner, group and device numbers; `error` is the errno (0 when it worked).
+export class FileFacts {
+  public error: int = 0
+  public mode: int = 0
+  public uid: int = 0
+  public gid: int = 0
+  public rdevMajor: int = 0
+  public rdevMinor: int = 0
+}
+
+/// `statx(AT_FDCWD, path)`: its layout is the same on every architecture (`stx_uid` at 20, `stx_gid` at 24, `stx_mode` at 28,
+/// `stx_rdev_major` at 128, `stx_rdev_minor` at 132; 256 bytes).
+export function factsOf(path: string): FileFacts {
+  const out = new FileFacts()
+  const buf = new Uint8Array(256)
+  // AT_FDCWD = -100, no flags (a symbolic link is followed), STATX_BASIC_STATS = 0x7ff
+  const r = statx(-100 as c_int, path, 0 as c_int, 0x7ff as c_uint, addr(buf)) as int
+  if (r < 0) {
+    out.error = errno()
+    return out
+  }
+  const u32 = (at: int): int => {
+    return (buf.get(at) as int) | ((buf.get(at + 1) as int) << 8) | ((buf.get(at + 2) as int) << 16) | ((buf.get(at + 3) as int) << 24)
+  }
+  out.uid = u32(20)
+  out.gid = u32(24)
+  out.mode = (buf.get(28) as int) | ((buf.get(29) as int) << 8)
+  out.rdevMajor = u32(128)
+  out.rdevMinor = u32(132)
+  return out
+}
+
+/// The groups this process is in (the effective one is not always among them).
+export function groups(): int[] {
+  const out: int[] = []
+  const room = new Uint8Array(4 * 256)
+  const n = getgroups(256 as c_int, addr(room)) as int
+  for (let i = 0; i < n; i++) {
+    const at = i * 4
+    out.push((room.get(at) as int) | ((room.get(at + 1) as int) << 8) | ((room.get(at + 2) as int) << 16) | ((room.get(at + 3) as int) << 24))
+  }
+  return out
+}

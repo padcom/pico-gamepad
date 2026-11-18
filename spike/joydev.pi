@@ -8,7 +8,7 @@ import {
   jsiocgname, jsiocgversion, keyName,
 } from "../ioctl"
 import { cText, errnoName, joydevButtonOrder, normalise, u16At, u32At } from "../decode"
-import { ask, closeFd, describe, openRead, readInto } from "../posix"
+import { ask, closeFd, describe, openRead, readInto } from "./sys"
 import { fixed, parseJsEvent } from "./format"
 import { Node, heading, ms, nodesOf, nowUs, signed, sysfsOf } from "./report"
 

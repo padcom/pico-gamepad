@@ -1,7 +1,7 @@
 // Hot-plug over the fake system: what is told, in which order, and what the ACL's lag does.
 import { describe, it, expect } from "std/test"
 import { delay } from "std/timers"
-import { FakeSystem, fakeInfo } from "./fake"
+import { FakeDevice, FakeSystem, fakeInfo } from "./fake"
 import { watchPads } from "./watch"
 import { OpenedPad, PadError, PadEvent, PadInfo, PadSystem, WatchOptions } from "./types"
 
@@ -121,6 +121,46 @@ async function aNodeThatIsNotAPadIsDeniedAtOnce(): Promise<void> throws Error {
   expect(told.lines.join("|")).toBe("denied /dev/input/event1 NOT_A_PAD")
 }
 
+/// A system whose scans are scripted: each look gets the next list (the last one stays), and every pad can be opened.
+class Scripted implements PadSystem {
+  public lists: PadInfo[][] = []
+  public looks: int = 0
+
+  public async scan(): Promise<PadInfo[]> {
+    const at = if (looks < lists.length) looks else lists.length - 1
+    looks += 1
+    return lists[at].slice(0)
+  }
+
+  public async open(_info: PadInfo): Promise<OpenedPad> throws PadError {
+    return { axes: [], device: new FakeDevice(0, 0, 0) }
+  }
+}
+
+/// What a watch told of a script of listings, once it has looked at all of them.
+async function toldOf(script: PadInfo[][]): Promise<string> throws Error {
+  const system = new Scripted()
+  system.lists = script
+  const told = new Told()
+  const watch = watchPads((e: PadEvent) => told.add(e), FAST, system)
+  await until(() => system.looks > script.length)
+  watch.stop()
+  await watch.done()
+  return told.lines.join("|")
+}
+
+async function aReplugAtTheSamePathIsAnotherPad(): Promise<void> throws Error {
+  const radio = pad(1)
+  // unplugged and plugged back between two looks, with another serial number
+  const other = fakeInfo("Pad 1", 0x1209, 0x4f55, 8, 24, "S9", "usb-1", "/dev/input/event1")
+  expect(await toldOf([[radio], [other]])).toBe("added /dev/input/event1|removed /dev/input/event1|added /dev/input/event1")
+  // the same radio on another port
+  const moved = fakeInfo("Pad 1", 0x1209, 0x4f55, 8, 24, "S1", "usb-7", "/dev/input/event1")
+  expect(await toldOf([[radio], [moved]])).toBe("added /dev/input/event1|removed /dev/input/event1|added /dev/input/event1")
+  // the very same pad, looked at again: nothing new
+  expect(await toldOf([[radio], [radio], [radio]])).toBe("added /dev/input/event1")
+}
+
 describe("watching what is plugged in", () => {
   it("tells what is there at once, then every change in order", whatIsThereIsToldAtOnceThenTheChanges)
   it("does not take the lag of the ACL for a denial", aLagOfTheAclIsNotADenial)
@@ -128,4 +168,5 @@ describe("watching what is plugged in", () => {
   it("tells nothing of a pad that went while it waited", aPadThatWentWhileWaitingIsNotTold)
   it("tells nothing and looks at nothing after stop", nothingIsToldAfterStop)
   it("denies at once a node that is not a pad", aNodeThatIsNotAPadIsDeniedAtOnce)
+  it("tells a replug at the same path as the old pad gone and a new one added", aReplugAtTheSamePathIsAnotherPad)
 })

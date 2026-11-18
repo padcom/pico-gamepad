@@ -94,6 +94,15 @@ async function run(watch: PadWatch, handler: (e: PadEvent) => void, intervalMs: 
 async function look(
   now: PadInfo[], known: PadInfo[], denied: PadInfo[], waiting: Waiting[], handler: (e: PadEvent) => void, denyAfterMs: int, system: PadSystem,
 ): Promise<void> {
+  // (a pad that was unplugged and another plugged in between two looks, at the same path: the old one is gone, the new one is new)
+  replaced(now, known, true, handler)
+  replaced(now, denied, false, handler)
+  for (let i = waiting.length - 1; i >= 0; i--) {
+    const current = findAt(now, waiting[i].pad.path)
+    if (current != null && !same(waiting[i].pad, current!)) {
+      dropWaiting(waiting, i)
+    }
+  }
   for (const pad of now) {
     if (!has(known, pad.path) && !has(denied, pad.path) && !waitingFor(waiting, pad.path)) {
       waiting.push(new Waiting(pad, nowMs()))
@@ -118,6 +127,37 @@ async function look(
   }
   forget(now, known, true, handler)
   forget(now, denied, false, handler)
+}
+
+/// The pad at `path` in `pads`, or null.
+function findAt(pads: PadInfo[], path: string): PadInfo? {
+  for (const p of pads) {
+    if (p.path == path) {
+      return p
+    }
+  }
+  return null
+}
+
+/// Whether two listings are the same pad: the path, the id, where it is plugged in and its serial number (a replug at a path the kernel
+/// handed out again is another pad, and one that is not told as such is a pad that reads DISCONNECTED for ever and a new one that nobody
+/// knows).
+function same(a: PadInfo, b: PadInfo): bool {
+  return a.path == b.path && a.id == b.id && a.phys == b.phys && a.uniq == b.uniq && a.vendor == b.vendor && a.product == b.product
+}
+
+/// What is in `list` at the path of a pad that is there now but is not the same pad is dropped, and told as gone when `tell`.
+function replaced(now: PadInfo[], list: PadInfo[], tell: bool, handler: (e: PadEvent) => void): void {
+  for (let i = list.length - 1; i >= 0; i--) {
+    const current = findAt(now, list[i].path)
+    if (current != null && !same(list[i], current!)) {
+      const gone = list[i]
+      list.splice(i, 1)
+      if (tell) {
+        handler({ kind: "removed", pad: gone, code: "" })
+      }
+    }
+  }
 }
 
 function dropWaiting(waiting: Waiting[], i: int): void {

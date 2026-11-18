@@ -3,7 +3,8 @@
 
 /// Why a pad couldn't be listed, opened or read: `NOT_FOUND`, `PERMISSION_DENIED` (on Linux: the desktop's ACL did not give this
 /// user the device, and the answer is never "join the input group"), `NOT_A_PAD` (a node that is not a joystick: a keyboard or a mouse
-/// is never opened), `DISCONNECTED` (the device is gone: it was unplugged), `IO`, `UNSUPPORTED` (this platform has no backend yet) or
+/// is never opened), `CHANGED` (another device is behind the node than the one that was listed: the kernel gives the lowest free event
+/// number to the next device; it was let go of at once), `DISCONNECTED` (the device is gone: it was unplugged), `IO`, `UNSUPPORTED` (this platform has no backend yet) or
 /// `CLOSED`. It carries the `errno` of the call that failed, 0 when there was none.
 export class PadError extends Error {
   public code: string
