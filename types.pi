@@ -1,0 +1,111 @@
+// What every platform's pad code shares: the errors, what a listing and an open pad report, and the two interfaces a backend (or a
+// test's fake) implements. Pure: it builds on every platform.
+
+/// Why a pad couldn't be listed, opened or read: `NOT_FOUND`, `PERMISSION_DENIED` (on Linux: the desktop's ACL did not give this
+/// user the device, and the answer is never "join the input group"), `NOT_A_PAD` (a node that is not a joystick: a keyboard or a mouse
+/// is never opened), `CHANGED` (another device is behind the node than the one that was listed: the kernel gives the lowest free event
+/// number to the next device; it was let go of at once), `DISCONNECTED` (the device is gone: it was unplugged), `IO`, `UNSUPPORTED` (this platform has no backend yet) or
+/// `CLOSED`. It carries the `errno` of the call that failed, 0 when there was none.
+export class PadError extends Error {
+  public code: string
+  public errno: int
+
+  constructor(code: string, message: string, errno: int = 0) {
+    super(message)
+    this.code = code
+    this.errno = errno
+  }
+}
+
+/// A pad that is plugged in, as the system lists it, without opening it.
+export struct PadInfo {
+  /// Stable and unique among the pads there now: `vvvv:pppp` (vendor and product), `#serial` when the device has one, and `@phys`
+  /// when two pads would otherwise be the same.
+  id: string
+  /// The id a browser gives it (Chromium's `name (Vendor: vvvv Product: pppp)`), which a mapping saved by the browser is keyed by.
+  legacyId: string
+  name: string
+  vendor: int
+  product: int
+  /// The device's serial number ("" when it has none) and where it is plugged in (the USB port's path).
+  uniq: string
+  phys: string
+  /// What `openPad` takes (on Linux, `/dev/input/eventN`).
+  path: string
+  /// Where the readings come from: `evdev`.
+  source: string
+  /// The ABS codes (axes) and the key codes (buttons) the device has, in the order they are numbered: axis `i` is `axisCodes[i]`
+  /// (ascending), button `j` is `buttonCodes[j]` (joydev's order, the one `jstest` and the browser use).
+  axisCodes: int[]
+  buttonCodes: int[]
+}
+
+/// One axis of an open pad: what the device says of it.
+export struct AxisInfo {
+  /// Its place among the axes (0-based, ascending by code: the browser's index).
+  index: int
+  /// The kernel's code (`ABS_X` is 0) and name.
+  code: int
+  name: string
+  /// The range the device declares, its dead zone (`flat`) and its noise filter (`fuzz`), as the device reports them.
+  minimum: int
+  maximum: int
+  flat: int
+  fuzz: int
+}
+
+/// What a pad says now.
+export struct PadState {
+  /// When it was read, in microseconds on the machine's monotonic clock (from the program's start): the freshness of a reading is
+  /// this, never the device's own timestamp (which only moves when the state changes).
+  at: int
+  /// The raw value of every axis, as the device reports it.
+  raw: int[]
+  /// The same as -1 to 1 by the declared range (nothing else: no dead zone, no calibration).
+  axes: f64[]
+  /// Which buttons are down.
+  buttons: bool[]
+}
+
+/// A change of what is plugged in, from `watchPads`.
+export struct PadEvent {
+  /// `added` (it can be opened: the system lets this user), `removed`, or `denied` (it appeared and could not be opened: for
+  /// `denyAfterMs` it was tried again, because the desktop's ACL can come a moment after the node).
+  kind: string
+  pad: PadInfo
+  /// Why it is denied (`PERMISSION_DENIED` ...), "" for the others.
+  code: string
+}
+
+/// How `watchPads` looks.
+export struct WatchOptions {
+  /// How often the system is looked at (default 100 ms).
+  intervalMs?: int
+  /// How long a pad that cannot be opened is tried again before it is `denied` (default 2000 ms: measured on the real radio, the
+  /// access came 264 ms after the node did).
+  denyAfterMs?: int
+}
+
+/// The device of an open pad: what reads it (the Linux ioctls, or a test's script).
+export interface PadDevice {
+  /// The raw value of every axis now. Throws `DISCONNECTED` when the device is gone.
+  rawAxes(): int[] throws PadError
+  /// Which buttons are down now. Throws `DISCONNECTED` when the device is gone.
+  buttons(): bool[] throws PadError
+  /// Lets go of the device.
+  close(): void
+}
+
+/// What a platform's pads are reached through (Linux: /dev/input and sysfs; a test: a script).
+export interface PadSystem {
+  /// The pads there are now (joysticks only), in a stable order, from what the system says of them without opening them.
+  scan(): Promise<PadInfo[]>
+  /// Opens one: its axes and its device. Throws `PERMISSION_DENIED` when this user may not (yet), `NOT_FOUND` when it is gone.
+  open(info: PadInfo): Promise<OpenedPad, PadError>
+}
+
+/// What `PadSystem.open` gives: the axes (with their ranges) and the device to read.
+export struct OpenedPad {
+  axes: AxisInfo[]
+  device: PadDevice
+}

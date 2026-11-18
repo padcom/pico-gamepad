@@ -1,0 +1,13 @@
+// Pads where this package has no backend yet: a program still builds and runs, it just finds no pads and can't open one.
+import { OpenedPad, PadError, PadInfo, PadSystem } from "./types"
+
+/// No pads, and `open` always fails with `UNSUPPORTED`.
+export class UnsupportedSystem implements PadSystem {
+  public async scan(): Promise<PadInfo[]> {
+    return []
+  }
+
+  public async open(info: PadInfo): Promise<OpenedPad> throws PadError {
+    throw new PadError("UNSUPPORTED", `${info.path}: game controllers aren't supported on this platform yet`)
+  }
+}

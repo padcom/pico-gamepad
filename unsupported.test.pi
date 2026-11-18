@@ -1,0 +1,25 @@
+// What a platform without a backend does: it lists no pad and cannot open one (`UNSUPPORTED`), and a program that uses the package
+// still builds and runs there.
+import { describe, it, expect } from "std/test"
+import { UnsupportedSystem } from "./unsupported"
+import { fakeInfo } from "./fake"
+import { PadError } from "./types"
+
+async function listsNothing(): Promise<void> throws Error {
+  expect((await new UnsupportedSystem().scan()).length).toBe(0)
+}
+
+async function cannotOpenOne(): Promise<void> throws Error {
+  let code = "none"
+  try {
+    await new UnsupportedSystem().open(fakeInfo("Pad", 1, 2, 4, 4, "", "usb-1", "/dev/input/event3"))
+  } catch (e: PadError) {
+    code = e.code
+  }
+  expect(code).toBe("UNSUPPORTED")
+}
+
+describe("a platform without a backend", () => {
+  it("lists no pad", listsNothing)
+  it("cannot open one: UNSUPPORTED", cannotOpenOne)
+})

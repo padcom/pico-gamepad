@@ -1,0 +1,189 @@
+// Hot-plug: what is plugged in is looked at on a timer (100 ms by default) and the changes are told. A pad that appears and cannot be
+// opened yet is tried again every time, for `denyAfterMs` (2 s): the desktop's ACL comes a moment after the node does (264 ms on the
+// real radio), and "denied" is only said once that time has passed. Polling, not inotify: nothing here needs a latency below a tenth
+// of a second, and it works the same on every platform that has a `PadSystem`.
+import { delay } from "std/timers"
+import { defaultSystem } from "./system"
+import { PadError, PadEvent, PadInfo, PadSystem, WatchOptions } from "./types"
+
+/// A running watch: `stop()` ends it, `done()` settles when the loop has.
+export class PadWatch {
+  public stopped: bool = false
+  public running: Promise<void>? = null
+  public readonly abort: AbortController = new AbortController()
+
+  /// Ends the watch (the handler is not called again).
+  public stop(): void {
+    stopped = true
+    abort.abort()
+  }
+
+  /// Settles once the watch has ended (after `stop()`).
+  public async done(): Promise<void> {
+    if (running != null) {
+      await running!
+    }
+  }
+}
+
+/// A pad that appeared and has not been openable yet.
+class Waiting {
+  public pad: PadInfo
+  public sinceMs: int
+
+  constructor(pad: PadInfo, sinceMs: int) {
+    this.pad = pad
+    this.sinceMs = sinceMs
+  }
+}
+
+function nowMs(): int {
+  return performance.now() as int
+}
+
+/// Whether `pads` has one at `path`.
+function has(pads: PadInfo[], path: string): bool {
+  for (const p of pads) {
+    if (p.path == path) {
+      return true
+    }
+  }
+  return false
+}
+
+function waitingFor(waiting: Waiting[], path: string): bool {
+  for (const w of waiting) {
+    if (w.pad.path == path) {
+      return true
+    }
+  }
+  return false
+}
+
+/// Tells `handler` what is plugged in now (every pad that is there is `added` at once), and then every change: `added` (it can be
+/// opened), `removed`, and `denied` (it cannot be opened, even after `denyAfterMs`). A node that is not a pad's to open (`NOT_A_PAD`)
+/// is `denied` at once. The handler must not throw.
+export function watchPads(handler: (e: PadEvent) => void, options: WatchOptions = {}, system: PadSystem = defaultSystem()): PadWatch {
+  const watch = new PadWatch()
+  watch.running = run(watch, handler, options.intervalMs ?? 100, options.denyAfterMs ?? 2000, system)
+  return watch
+}
+
+async function run(watch: PadWatch, handler: (e: PadEvent) => void, intervalMs: int, denyAfterMs: int, system: PadSystem): Promise<void> {
+  const known: PadInfo[] = []
+  const denied: PadInfo[] = []
+  const waiting: Waiting[] = []
+  while (!watch.stopped) {
+    let now: PadInfo[] = []
+    try {
+      now = await system.scan()
+    } catch (e: Error) {
+      // a scan that fails saw nothing new: what was known stays, and the next one tries again
+      now = known.concat(denied)
+    }
+    await look(now, known, denied, waiting, handler, denyAfterMs, system)
+    try {
+      await delay(intervalMs, watch.abort.signal)
+    } catch (e: Error) {
+      // stopped
+    }
+  }
+}
+
+/// One look: new pads are tried, the waiting ones tried again, and what has gone is told.
+async function look(
+  now: PadInfo[], known: PadInfo[], denied: PadInfo[], waiting: Waiting[], handler: (e: PadEvent) => void, denyAfterMs: int, system: PadSystem,
+): Promise<void> {
+  // (a pad that was unplugged and another plugged in between two looks, at the same path: the old one is gone, the new one is new)
+  replaced(now, known, true, handler)
+  replaced(now, denied, false, handler)
+  for (let i = waiting.length - 1; i >= 0; i--) {
+    const current = findAt(now, waiting[i].pad.path)
+    if (current != null && !same(waiting[i].pad, current!)) {
+      dropWaiting(waiting, i)
+    }
+  }
+  for (const pad of now) {
+    if (!has(known, pad.path) && !has(denied, pad.path) && !waitingFor(waiting, pad.path)) {
+      waiting.push(new Waiting(pad, nowMs()))
+    }
+  }
+  for (let i = waiting.length - 1; i >= 0; i--) {
+    const w = waiting[i]
+    if (!has(now, w.pad.path)) {
+      dropWaiting(waiting, i)
+    } else {
+      const code = await attempt(w.pad, system)
+      if (code == "") {
+        dropWaiting(waiting, i)
+        known.push(w.pad)
+        handler({ kind: "added", pad: w.pad, code: "" })
+      } else if (code != "PERMISSION_DENIED" || nowMs() - w.sinceMs >= denyAfterMs) {
+        dropWaiting(waiting, i)
+        denied.push(w.pad)
+        handler({ kind: "denied", pad: w.pad, code: code })
+      }
+    }
+  }
+  forget(now, known, true, handler)
+  forget(now, denied, false, handler)
+}
+
+/// The pad at `path` in `pads`, or null.
+function findAt(pads: PadInfo[], path: string): PadInfo? {
+  for (const p of pads) {
+    if (p.path == path) {
+      return p
+    }
+  }
+  return null
+}
+
+/// Whether two listings are the same pad: the path, the id, where it is plugged in and its serial number (a replug at a path the kernel
+/// handed out again is another pad, and one that is not told as such is a pad that reads DISCONNECTED for ever and a new one that nobody
+/// knows).
+function same(a: PadInfo, b: PadInfo): bool {
+  return a.path == b.path && a.id == b.id && a.phys == b.phys && a.uniq == b.uniq && a.vendor == b.vendor && a.product == b.product
+}
+
+/// What is in `list` at the path of a pad that is there now but is not the same pad is dropped, and told as gone when `tell`.
+function replaced(now: PadInfo[], list: PadInfo[], tell: bool, handler: (e: PadEvent) => void): void {
+  for (let i = list.length - 1; i >= 0; i--) {
+    const current = findAt(now, list[i].path)
+    if (current != null && !same(list[i], current!)) {
+      const gone = list[i]
+      list.splice(i, 1)
+      if (tell) {
+        handler({ kind: "removed", pad: gone, code: "" })
+      }
+    }
+  }
+}
+
+function dropWaiting(waiting: Waiting[], i: int): void {
+  waiting.splice(i, 1)
+}
+
+/// What has gone from `list` (not in `now` any more) is dropped, and told when `tell`.
+function forget(now: PadInfo[], list: PadInfo[], tell: bool, handler: (e: PadEvent) => void): void {
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (!has(now, list[i].path)) {
+      const gone = list[i]
+      list.splice(i, 1)
+      if (tell) {
+        handler({ kind: "removed", pad: gone, code: "" })
+      }
+    }
+  }
+}
+
+/// Opens the pad and lets go of it at once: "" when it can be opened, else the code of why not.
+async function attempt(pad: PadInfo, system: PadSystem): Promise<string> {
+  try {
+    const opened = await system.open(pad)
+    opened.device.close()
+    return ""
+  } catch (e: PadError) {
+    return e.code
+  }
+}

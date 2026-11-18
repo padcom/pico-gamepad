@@ -1,0 +1,211 @@
+// The decoding of what the kernel answers (canned buffers), the ordering rules, the normalisation, the classification and the ids:
+// everything that needs no device, on every platform.
+import { describe, it, expect } from "std/test"
+import {
+  ABS_MAX, BTN_GAMEPAD, BTN_JOYSTICK, BTN_MISC, BTN_MOUSE, BTN_TOUCH, BTN_TRIGGER_HAPPY, KEY_MAX, absName, eviocgabs, eviocgbit, eviocgid,
+  eviocgkey, eviocgname, eviocgversion, hex, ioc, jsiocgaxes, jsiocgaxmap, jsiocgbtnmap, jsiocgbuttons, jsiocgname, jsiocgversion, keyName,
+} from "./ioctl"
+import {
+  chromiumId, classify, codesOf, codesOfSysfs, cText, errnoName, joydevButtonOrder, normalise, padIds, parseAbsInfo, parseId, s16At, s32At,
+  testBit, u16At, u32At,
+} from "./decode"
+
+/// A bitmap of `bytes` bytes with the bits of `codes` set (what an EVIOCGBIT answers).
+function bitmap(codes: int[], bytes: int): Uint8Array {
+  const b = new Uint8Array(bytes)
+  for (const code of codes) {
+    b.set(code >> 3, ((b.get(code >> 3) as int) | (1 << (code & 7))) as u8)
+  }
+  return b
+}
+
+function range(from: int, to: int): int[] {
+  const out: int[] = []
+  for (let i = from; i <= to; i++) {
+    out.push(i)
+  }
+  return out
+}
+
+function ioctlNumbersAreTheKernels(): void {
+  // (the values `jstest`, `evtest` and the kernel headers have: _IOC on x86-64 and arm64)
+  expect(hex(eviocgversion(), 8)).toBe("80044501")
+  expect(hex(eviocgid(), 8)).toBe("80084502")
+  expect(hex(eviocgname(256), 8)).toBe("81004506")
+  expect(hex(eviocgkey(96), 8)).toBe("80604518")
+  expect(hex(eviocgbit(3, 8), 8)).toBe("80084523")
+  expect(hex(eviocgabs(0), 8)).toBe("80184540")
+  expect(hex(eviocgabs(7), 8)).toBe("80184547")
+  expect(hex(jsiocgversion(), 8)).toBe("80046a01")
+  expect(hex(jsiocgaxes(), 8)).toBe("80016a11")
+  expect(hex(jsiocgbuttons(), 8)).toBe("80016a12")
+  expect(hex(jsiocgname(128), 8)).toBe("80806a13")
+  expect(hex(jsiocgaxmap(), 8)).toBe("80406a32")
+  expect(hex(jsiocgbtnmap(), 8)).toBe("84006a34")
+  expect(ioc(2, 69, 1, 4)).toBe(eviocgversion())
+}
+
+function codesHaveNames(): void {
+  expect(absName(0)).toBe("ABS_X")
+  expect(absName(4)).toBe("ABS_RY")
+  expect(absName(7)).toBe("ABS_RUDDER")
+  expect(absName(0x10)).toBe("ABS_HAT0X")
+  expect(absName(0x2f)).toBe("ABS_0x2f")
+  expect(keyName(BTN_JOYSTICK)).toBe("BTN_TRIGGER")
+  expect(keyName(BTN_GAMEPAD)).toBe("BTN_SOUTH")
+  expect(keyName(BTN_MISC + 3)).toBe("BTN_3")
+  expect(keyName(BTN_TRIGGER_HAPPY)).toBe("BTN_TRIGGER_HAPPY1")
+  expect(keyName(KEY_MAX)).toBe("BTN_TRIGGER_HAPPY64")
+  expect(keyName(30)).toBe("KEY_0x01e")
+  expect(hex(0x4f54, 4)).toBe("4f54")
+  expect(hex(0, 4)).toBe("0000")
+}
+
+function bitmapsAreReadInTheKernelsOrder(): void {
+  // ABS=ff: the TX16S's eight axes, codes 0 to 7
+  const abs = new Uint8Array(8)
+  abs.set(0, 0xff as u8)
+  expect(codesOf(abs, ABS_MAX).join(",")).toBe("0,1,2,3,4,5,6,7")
+  expect(testBit(abs, 7)).toBe(true)
+  expect(testBit(abs, 8)).toBe(false)
+  expect(testBit(abs, 999)).toBe(false)
+  expect(testBit(abs, -1)).toBe(false)
+  const high = bitmap([8, 20, 63], 8)
+  expect(codesOf(high, ABS_MAX).join(",")).toBe("8,20,63")
+  expect(codesOf(high, 10).join(",")).toBe("8")
+  expect(codesOf(new Uint8Array(1), ABS_MAX).length).toBe(0)
+}
+
+function whatTheKernelSaysOfAnIdIsDecoded(): void {
+  // bustype 3 (USB), vendor 0x1209, product 0x4f54, version 0x0111: the TX16S's
+  const raw = new Uint8Array(8)
+  raw.set(0, 3 as u8)
+  raw.set(2, 0x09 as u8)
+  raw.set(3, 0x12 as u8)
+  raw.set(4, 0x54 as u8)
+  raw.set(5, 0x4f as u8)
+  raw.set(6, 0x11 as u8)
+  raw.set(7, 0x01 as u8)
+  const id = parseId(raw)
+  expect(`${id.bustype} ${hex(id.vendor, 4)} ${hex(id.product, 4)} ${hex(id.version, 4)}`).toBe("3 1209 4f54 0111")
+  expect(chromiumId("OpenTX Radiomaster TX16S Joystick", id.vendor, id.product))
+    .toBe("OpenTX Radiomaster TX16S Joystick (Vendor: 1209 Product: 4f54)")
+}
+
+function anAbsInfoIsDecodedWithItsSigns(): void {
+  const raw = new Uint8Array(24)
+  // value -5, minimum -32767, maximum 32767, fuzz 16, flat 0, resolution 0 (as s32, little endian)
+  raw.set(0, 0xfb as u8)
+  raw.set(1, 0xff as u8)
+  raw.set(2, 0xff as u8)
+  raw.set(3, 0xff as u8)
+  raw.set(4, 0x01 as u8)
+  raw.set(5, 0x80 as u8)
+  raw.set(6, 0xff as u8)
+  raw.set(7, 0xff as u8)
+  raw.set(8, 0xff as u8)
+  raw.set(9, 0x7f as u8)
+  raw.set(12, 16 as u8)
+  const info = parseAbsInfo(raw)
+  expect(`${info.value} ${info.minimum} ${info.maximum} ${info.fuzz} ${info.flat} ${info.resolution}`).toBe("-5 -32767 32767 16 0 0")
+  expect(s32At(raw, 0)).toBe(-5)
+  expect(u32At(raw, 0)).toBe(4294967291)
+  expect(u16At(raw, 4)).toBe(0x8001)
+  expect(s16At(raw, 4)).toBe(-32767)
+}
+
+function textIsCutAtTheNul(): void {
+  const raw = new Uint8Array(16)
+  const text = new TextEncoder().encode("TX16S")
+  for (let i = 0; i < text.length; i++) {
+    raw.set(i, text.get(i))
+  }
+  expect(cText(raw)).toBe("TX16S")
+  expect(cText(new Uint8Array(4))).toBe("")
+}
+
+function sysfsCapabilitiesAreReadWithoutOpeningTheDevice(): void {
+  expect(codesOfSysfs("ff\n", ABS_MAX).join(",")).toBe("0,1,2,3,4,5,6,7")
+  // words are as wide as an unsigned long, the most significant first: the second word is codes 64 and up
+  expect(codesOfSysfs("1 8000000000000001", KEY_MAX).join(",")).toBe("0,63,64")
+  expect(codesOfSysfs("1 0 0", KEY_MAX).join(",")).toBe("128")
+  expect(codesOfSysfs("1 0", 63).length).toBe(0)
+  expect(codesOfSysfs("1 80000000", KEY_MAX, 32).join(",")).toBe("31,32")
+  expect(codesOfSysfs("", KEY_MAX).length).toBe(0)
+}
+
+function errnosAreNamed(): void {
+  expect(errnoName(13)).toBe("EACCES")
+  expect(errnoName(19)).toBe("ENODEV")
+  expect(errnoName(1234)).toBe("errno 1234")
+}
+
+function normalisationIsTheDeclaredRangeAndNothingElse(): void {
+  const to = (v: int, lo: int, hi: int): string => `${Math.round(normalise(v, lo, hi) * 1000.0)}`
+  // the real radio's range: 0..2047, centre 1023.5
+  expect(to(0, 0, 2047)).toBe("-1000")
+  expect(to(2047, 0, 2047)).toBe("1000")
+  expect(to(1023, 0, 2047)).toBe("0")
+  expect(to(-32767, -32767, 32767)).toBe("-1000")
+  expect(to(0, -32767, 32767)).toBe("0")
+  expect(to(1024, 0, 2048)).toBe("0")
+  // outside the range: held to the ends; an empty or upside-down range reads 0 (never divides by zero)
+  expect(to(40000, -32767, 32767)).toBe("1000")
+  expect(to(-40000, -32767, 32767)).toBe("-1000")
+  expect(to(5, 3, 3)).toBe("0")
+  expect(to(5, 10, 0)).toBe("0")
+}
+
+function devicesAreToldApartByTheirCapabilities(): void {
+  const stick = range(0, 7)
+  expect(classify(true, false, stick, range(BTN_JOYSTICK, BTN_JOYSTICK + 15))).toBe("joystick")
+  // (the TX16S: 24 buttons from BTN_SOUTH, then BTN_TRIGGER_HAPPY)
+  expect(classify(true, false, stick, range(BTN_GAMEPAD, BTN_GAMEPAD + 15).concat(range(0x2c0, 0x2c7)))).toBe("joystick")
+  expect(classify(false, false, [], range(1, 120))).toBe("keyboard")
+  expect(classify(false, true, [], [BTN_MOUSE, BTN_MOUSE + 1, BTN_MOUSE + 2])).toBe("mouse")
+  expect(classify(true, false, [0, 1, 0x35, 0x36], [BTN_TOUCH, 0x145, 0x14d])).toBe("touchpad")
+  // one axis is not a joystick; axes with no joystick-range button are not one either
+  expect(classify(true, false, [0], range(BTN_JOYSTICK, BTN_JOYSTICK + 3))).toBe("other")
+  expect(classify(true, false, stick, [BTN_MISC])).toBe("other")
+}
+
+function buttonsComeInJoydevsOrderNotPlainAscending(): void {
+  expect(joydevButtonOrder([1, 2, 0x120, 0x121, 0x130]).join(",")).toBe("288,289,304,1,2")
+  expect(joydevButtonOrder(range(BTN_GAMEPAD, BTN_GAMEPAD + 3)).join(",")).toBe("304,305,306,307")
+  expect(joydevButtonOrder([]).length).toBe(0)
+}
+
+function idsAreStableAndUnique(): void {
+  // one radio with a serial number
+  expect(padIds([0x1209], [0x4f54], ["00000000001B"], ["usb-0000:00:03.0-2.1/input0"]).join("|")).toBe("1209:4f54#00000000001B")
+  // no serial number, or all zeros: just the vendor and the product
+  expect(padIds([0x1209], [0x4f54], [""], ["usb-1"]).join("|")).toBe("1209:4f54")
+  expect(padIds([0x1209], [0x4f54], ["0000"], ["usb-1"]).join("|")).toBe("1209:4f54")
+  // two identical radios without serial numbers: told apart by where they are plugged in
+  expect(padIds([0x1209, 0x1209], [0x4f54, 0x4f54], ["", ""], ["usb-1", "usb-2"]).join("|")).toBe("1209:4f54@usb-1|1209:4f54@usb-2")
+  // two identical radios with their own serial numbers need no port
+  expect(padIds([0x1209, 0x1209], [0x4f54, 0x4f54], ["A", "B"], ["usb-1", "usb-2"]).join("|")).toBe("1209:4f54#A|1209:4f54#B")
+  // another pad does not change a pad's id
+  expect(padIds([0x1209, 0x045e], [0x4f54, 0x028e], ["", ""], ["usb-1", "usb-2"]).join("|")).toBe("1209:4f54|045e:028e")
+}
+
+describe("the evdev and joydev numbers", () => {
+  it("are the kernel's _IOC values", ioctlNumbersAreTheKernels)
+  it("have the names the kernel gives the codes", codesHaveNames)
+})
+
+describe("what the kernel answers", () => {
+  it("is a bitmap read in the kernel's bit order", bitmapsAreReadInTheKernelsOrder)
+  it("has an id of four u16, and the browser's id of it", whatTheKernelSaysOfAnIdIsDecoded)
+  it("has an absinfo of six s32 with their signs", anAbsInfoIsDecodedWithItsSigns)
+  it("has text that ends at the NUL", textIsCutAtTheNul)
+  it("has capabilities in sysfs, readable without opening the device", sysfsCapabilitiesAreReadWithoutOpeningTheDevice)
+  it("has errnos that are named", errnosAreNamed)
+})
+
+describe("what is made of it", () => {
+  it("is -1 to 1 from the declared range and nothing else", normalisationIsTheDeclaredRangeAndNothingElse)
+  it("tells a joystick from a keyboard, a mouse and a touchpad", devicesAreToldApartByTheirCapabilities)
+  it("numbers the buttons the way joydev does", buttonsComeInJoydevsOrderNotPlainAscending)
+  it("gives every pad an id that is stable and unique", idsAreStableAndUnique)
+})

@@ -1,0 +1,252 @@
+// What the kernel's answers mean, from the bytes alone (no device, so all of it is unit-tested with canned buffers, and it builds on
+// every platform). The bitmaps are the kernel's own: bit n of the buffer is byte n / 8, bit n % 8 (the layout of a little-endian
+// machine, which x86-64 and arm64 are).
+import { BTN_DIGI, BTN_JOYSTICK, BTN_MISC, BTN_MOUSE, BTN_TOOL_FINGER, BTN_TOUCH, hex } from "./ioctl"
+
+/// Whether bit `code` of the bitmap `buf` is set (a code past its end is not).
+export function testBit(buf: Uint8Array, code: int): bool {
+  const at = code >> 3
+  if (code < 0 || at >= buf.length) {
+    return false
+  }
+  return (((buf.get(at) as int) >> (code & 7)) & 1) == 1
+}
+
+/// The codes whose bits are set, ascending, up to and including `max`.
+export function codesOf(buf: Uint8Array, max: int): int[] {
+  const out: int[] = []
+  for (let code = 0; code <= max; code++) {
+    if (testBit(buf, code)) {
+      out.push(code)
+    }
+  }
+  return out
+}
+
+/// The value of one hex digit, or -1.
+function nibble(c: string): int {
+  const digits = "0123456789abcdef"
+  return digits.indexOf(c.toLowerCase())
+}
+
+/// The codes of a sysfs capability file (`/sys/class/input/eventN/device/capabilities/abs`): words of hex digits, the most
+/// significant first, each word as wide as the kernel's `unsigned long` (64 bits on a 64-bit kernel), ascending, up to `max`. Read
+/// without opening the device, so a keyboard's capabilities can be seen without opening the keyboard.
+export function codesOfSysfs(text: string, max: int, wordBits: int = 64): int[] {
+  const words: string[] = []
+  for (const w of text.trim().split(" ")) {
+    if (w.length > 0) {
+      words.push(w)
+    }
+  }
+  const out: int[] = []
+  for (let i = 0; i < words.length; i++) {
+    const word = words[words.length - 1 - i]
+    for (let d = 0; d < word.length; d++) {
+      const value = nibble(word.slice(word.length - 1 - d, word.length - d))
+      for (let bit = 0; bit < 4 && value > 0; bit++) {
+        if (((value >> bit) & 1) == 1) {
+          const code = i * wordBits + d * 4 + bit
+          if (code <= max) {
+            out.push(code)
+          }
+        }
+      }
+    }
+  }
+  return out
+}
+
+/// The name of an errno (Linux, the same on x86-64 and arm64) for the ones a pad meets, else `errno N`.
+export function errnoName(e: int): string {
+  return match (e) {
+    1 => "EPERM",
+    2 => "ENOENT",
+    4 => "EINTR",
+    5 => "EIO",
+    6 => "ENXIO",
+    9 => "EBADF",
+    11 => "EAGAIN",
+    13 => "EACCES",
+    16 => "EBUSY",
+    19 => "ENODEV",
+    22 => "EINVAL",
+    25 => "ENOTTY",
+    75 => "EOVERFLOW",
+    _ => `errno ${e}`,
+  }
+}
+
+/// A little-endian u16 of `b` at `at`.
+export function u16At(b: Uint8Array, at: int): int {
+  return (b.get(at) as int) | ((b.get(at + 1) as int) << 8)
+}
+
+/// A little-endian u32 of `b` at `at`.
+export function u32At(b: Uint8Array, at: int): int {
+  return u16At(b, at) | (u16At(b, at + 2) << 16)
+}
+
+/// A little-endian s32 of `b` at `at`.
+export function s32At(b: Uint8Array, at: int): int {
+  const v = u32At(b, at)
+  return if (v >= 2147483648) v - 4294967296 else v
+}
+
+/// A little-endian s16 of `b` at `at`.
+export function s16At(b: Uint8Array, at: int): int {
+  const v = u16At(b, at)
+  return if (v >= 32768) v - 65536 else v
+}
+
+/// `struct input_id`.
+export struct InputId {
+  bustype: int
+  vendor: int
+  product: int
+  version: int
+}
+
+/// Reads an `EVIOCGID` answer.
+export function parseId(b: Uint8Array): InputId {
+  return { bustype: u16At(b, 0), vendor: u16At(b, 2), product: u16At(b, 4), version: u16At(b, 6) }
+}
+
+/// `struct input_absinfo`: the axis's value now, its range, its noise filter (fuzz), its dead zone (flat) and its resolution.
+export struct AbsInfo {
+  value: int
+  minimum: int
+  maximum: int
+  fuzz: int
+  flat: int
+  resolution: int
+}
+
+/// Reads an `EVIOCGABS` answer.
+export function parseAbsInfo(b: Uint8Array): AbsInfo {
+  return {
+    value: s32At(b, 0),
+    minimum: s32At(b, 4),
+    maximum: s32At(b, 8),
+    fuzz: s32At(b, 12),
+    flat: s32At(b, 16),
+    resolution: s32At(b, 20),
+  }
+}
+
+/// The text of a NUL-terminated buffer (what the kernel fills in for a name, a phys or a uniq).
+export function cText(b: Uint8Array): string {
+  let n = 0
+  while (n < b.length && b.get(n) != 0) {
+    n += 1
+  }
+  try {
+    return new TextDecoder().decode(b.subarray(0, n))
+  } catch (e: TypeError) {
+    return ""
+  }
+}
+
+/// An axis value as -1 to 1 from its declared range: nothing is calibrated, the range the device declares is the range. A range
+/// that is empty or upside down reads 0, and a value outside it is held to the ends. The device's own dead zone (`flat`) is NOT
+/// applied: it is reported, and what to do with it is the mapping's business.
+export function normalise(value: int, minimum: int, maximum: int): f64 {
+  if (maximum <= minimum) {
+    return 0.0
+  }
+  const v = if (value < minimum) minimum else if (value > maximum) maximum else value
+  return 2.0 * ((v - minimum) as f64) / ((maximum - minimum) as f64) - 1.0
+}
+
+/// What kind of device the capabilities say it is: a `joystick` (at least two axes and a button in the joystick or gamepad range),
+/// a `touchpad`, a `mouse`, a `keyboard` or `other`. Only a joystick is ever opened.
+export function classify(hasAbs: bool, hasRel: bool, absCodes: int[], keyCodes: int[]): string {
+  let joystickKey = false
+  let touch = false
+  let mouseKey = false
+  let typing = 0
+  for (const k of keyCodes) {
+    if (k >= BTN_JOYSTICK && k < BTN_DIGI) {
+      joystickKey = true
+    }
+    if (k == BTN_TOUCH || k == BTN_TOOL_FINGER) {
+      touch = true
+    }
+    if (k >= BTN_MOUSE && k < BTN_JOYSTICK) {
+      mouseKey = true
+    }
+    if (k < BTN_MISC) {
+      typing += 1
+    }
+  }
+  if (hasAbs && absCodes.length >= 2 && joystickKey) {
+    return "joystick"
+  }
+  if (touch) {
+    return "touchpad"
+  }
+  if (hasRel && mouseKey) {
+    return "mouse"
+  }
+  if (typing >= 20) {
+    return "keyboard"
+  }
+  return "other"
+}
+
+/// The order joydev numbers the buttons in: the codes from BTN_MISC up, ascending, THEN the codes below BTN_MISC, ascending (the
+/// kernel's `joydev_connect`). `jstest` and the browser's Gamepad API number buttons this way. (For the TX16S it is plain ascending
+/// order, which the G0 run on the real radio confirmed.)
+export function joydevButtonOrder(keyCodes: int[]): int[] {
+  const out: int[] = []
+  for (const k of keyCodes) {
+    if (k >= BTN_MISC) {
+      out.push(k)
+    }
+  }
+  for (const k of keyCodes) {
+    if (k < BTN_MISC) {
+      out.push(k)
+    }
+  }
+  return out
+}
+
+/// The id the browser gives a pad (Chromium's: the name, then the vendor and the product as four hex digits), which a mapping saved
+/// by the browser source is keyed by. The G0 run on the real radio confirmed that it is the string the application shows.
+export function chromiumId(name: string, vendor: int, product: int): string {
+  return `${name} (Vendor: ${hex(vendor, 4)} Product: ${hex(product, 4)})`
+}
+
+/// Whether a serial number says nothing: empty, or only zeros.
+function blank(serial: string): bool {
+  for (let i = 0; i < serial.length; i++) {
+    if (serial.slice(i, i + 1) != "0") {
+      return false
+    }
+  }
+  return true
+}
+
+/// The ids of a set of pads, in the order given: `vvvv:pppp` (vendor and product, four hex digits each), then `#uniq` when the device
+/// has a serial number (not all zeros, nor empty); two pads that still share an id (identical radios without serial numbers) get
+/// `#phys` as well, so that no two pads are ever the same id. `vendors`, `products`, `uniqs` and `physs` go together.
+export function padIds(vendors: int[], products: int[], uniqs: string[], physs: string[]): string[] {
+  const base: string[] = []
+  for (let i = 0; i < vendors.length; i++) {
+    const serial = uniqs[i].trim()
+    const hasSerial = !blank(serial)
+    base.push(`${hex(vendors[i], 4)}:${hex(products[i], 4)}${if (hasSerial) `#${serial}` else ""}`)
+  }
+  const out: string[] = []
+  for (let i = 0; i < base.length; i++) {
+    let shared = false
+    for (let j = 0; j < base.length; j++) {
+      if (j != i && base[j] == base[i]) {
+        shared = true
+      }
+    }
+    out.push(if (shared) `${base[i]}@${physs[i]}` else base[i])
+  }
+  return out
+}

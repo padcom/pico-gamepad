@@ -1,0 +1,67 @@
+// G0 spike: the program's flow (see evdev-probe.pi for how to run it).
+import { classify } from "../decode"
+import { closeFd } from "../posix"
+import { Node, Options, heading, nodesOf, parseOptions, sysfsOf } from "./report"
+import { listNodes, poll, probeEvdev, who } from "./probe"
+import { probeJoydev, watchNodes } from "./joydev"
+
+const USAGE = "usage: pico run spike/evdev-probe.pi -- [--seconds N] [--hz N] [--device PATH] [--joydev] [--watch N]"
+
+/// Runs what the command line asks for; the exit code.
+export async function run(argv: string[]): Promise<int> throws Error {
+  const options = parseOptions(argv)
+  if (options.problem != "") {
+    println(`${options.problem}\n${USAGE}`)
+    return 2
+  }
+  await who()
+  const nodes = await nodesOf()
+  await listNodes(nodes)
+  if (options.watchSeconds > 0) {
+    await watchNodes(options.watchSeconds)
+    return 0
+  }
+  if (options.joydev) {
+    return await joydevOf(options, nodes)
+  }
+  return await evdevOf(options, nodes)
+}
+
+/// The js node to probe: the one asked for, else the first that is a joystick by its capabilities (js0 may be a mouse).
+async function joydevOf(options: Options, nodes: Node[]): Promise<int> throws Error {
+  for (const node of nodes) {
+    if (!node.isEvent && (options.device == "" || options.device == node.path)) {
+      const sys = await sysfsOf(node)
+      if (options.device != "" || classify(true, false, sys.abs, sys.keys) == "joystick") {
+        await probeJoydev(node, options.seconds)
+        return 0
+      }
+    }
+  }
+  heading("7. joydev")
+  println("no js* node that is a joystick (the kernel has no joydev for this device, or it cannot be listed)")
+  return 1
+}
+
+async function evdevOf(options: Options, nodes: Node[]): Promise<int> throws Error {
+  let path = options.device
+  if (path == "") {
+    for (const node of nodes) {
+      if (path == "" && node.isEvent && node.kind == "joystick" && node.opened) {
+        path = node.path
+      }
+    }
+  }
+  if (path == "") {
+    heading("3. evdev")
+    println("no event* node that is a joystick and could be opened: see section 2 (class= and open)")
+    return 1
+  }
+  const pad = await probeEvdev(path)
+  if (pad == null) {
+    return 1
+  }
+  await poll(pad!, options.seconds, options.hz)
+  closeFd(pad!.fd)
+  return 0
+}

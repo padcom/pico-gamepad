@@ -1,0 +1,14 @@
+// G0 spike: what this machine says of its joysticks, read the way a backend would read them (see RUNSHEET.md). Reads only.
+//
+//   pico run spike/evdev-probe.pi                      list /dev/input, probe the first joystick, poll it for 10 s at 50 Hz
+//   pico run spike/evdev-probe.pi -- --seconds 20      poll for 20 s (unplug the radio during it: ENODEV is expected)
+//   pico run spike/evdev-probe.pi -- --device /dev/input/event7
+//   pico run spike/evdev-probe.pi -- --joydev          the same through /dev/input/js* (JSIOCG*, JS_EVENT_INIT, the event stream)
+//   pico run spike/evdev-probe.pi -- --watch 30        watch /dev/input for 30 s (plug the radio in), open() at once and again
+import { args, exit } from "std/process"
+import { run } from "./run"
+
+const code = await run(args)
+if (code != 0) {
+  exit(code as i32)
+}

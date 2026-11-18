@@ -1,0 +1,267 @@
+// Pads on Linux through evdev (/dev/input/event*): found from sysfs without opening anything, opened read-only and non-blocking
+// (never grabbed: reading must not take the device from another program), read by asking the kernel for its STATE now (EVIOCGABS and
+// EVIOCGKEY), never by following the event stream. So a still stick, a frozen device and a hung reader are not the same thing, no event
+// is ever missed, and an unplugged device answers ENODEV on the very next read. Measured on a real TX16S (shared/g0 in the team's notes):
+// a 50 Hz poll with absolute deadlines held, the desktop's ACL gave this user the radio without the `input` group, and it came 264 ms
+// after the node did.
+import { eventNodes, sysfsOf } from "./sysfs"
+import {
+  ABSINFO_BYTES, ABS_MAX, EV_ABS, EV_KEY, EV_REL, KEY_MAX, absName, eviocgabs, eviocgbit, eviocgid, eviocgkey, eviocgname, hex,
+} from "./ioctl"
+import { chromiumId, classify, codesOf, cText, joydevButtonOrder, padIds, parseAbsInfo, parseId, testBit } from "./decode"
+import { ask, closeFd, openRead } from "./posix"
+import { AxisInfo, OpenedPad, PadDevice, PadError, PadInfo, PadSystem } from "./types"
+
+/// What does an `ioctl`: the kernel's, or (in a test) one that answers from canned buffers. It fills `buf` and gives back 0 or a length,
+/// or the errno as a NEGATIVE number.
+export type Ioctl = (fd: int, request: int, buf: Uint8Array) => int
+
+/// The `PadError` of a failed call (`r` is the negative errno): `ENODEV` and `ENXIO` are a device that is gone.
+export function errorOf(what: string, r: int): PadError {
+  const e = -r
+  const code = match (e) {
+    2 => "NOT_FOUND",
+    13 => "PERMISSION_DENIED",
+    1 => "PERMISSION_DENIED",
+    19 => "DISCONNECTED",
+    6 => "DISCONNECTED",
+    9 => "CLOSED",
+    _ => "IO",
+  }
+  return new PadError(code, `${what}: ${errnoText(e)}`, e)
+}
+
+function errnoText(e: int): string {
+  return match (e) {
+    1 => "operation not permitted (EPERM)",
+    2 => "no such file or directory (ENOENT)",
+    5 => "input/output error (EIO)",
+    6 => "no such device or address (ENXIO)",
+    9 => "bad file descriptor (EBADF)",
+    13 => "permission denied (EACCES)",
+    19 => "no such device (ENODEV)",
+    25 => "inappropriate ioctl for device (ENOTTY)",
+    _ => `errno ${e}`,
+  }
+}
+
+/// An open evdev device: asks the kernel for the state of every axis and button.
+export class LinuxDevice implements PadDevice {
+  readonly fd: int
+  readonly path: string
+  readonly axisCodes: int[]
+  readonly buttonCodes: int[]
+  readonly ioctl: Ioctl
+  readonly closer: Closer
+  readonly one: Uint8Array = new Uint8Array(ABSINFO_BYTES)
+  readonly keys: Uint8Array = new Uint8Array(KEY_MAX / 8 + 1)
+  closed: bool = false
+
+  constructor(fd: int, path: string, axisCodes: int[], buttonCodes: int[], ioctl: Ioctl, closer: Closer = closeFd) {
+    this.fd = fd
+    this.path = path
+    this.axisCodes = axisCodes
+    this.buttonCodes = buttonCodes
+    this.ioctl = ioctl
+    this.closer = closer
+  }
+
+  public rawAxes(): int[] throws PadError {
+    check()
+    const out: int[] = []
+    const ask = this.ioctl
+    for (const code of axisCodes) {
+      const r = ask(fd, eviocgabs(code), one)
+      if (r < 0) {
+        throw errorOf(`${path}: EVIOCGABS(${absName(code)})`, r)
+      }
+      out.push(parseAbsInfo(one).value)
+    }
+    return out
+  }
+
+  public buttons(): bool[] throws PadError {
+    check()
+    const ask = this.ioctl
+    const r = ask(fd, eviocgkey(keys.length), keys)
+    if (r < 0) {
+      throw errorOf(`${path}: EVIOCGKEY`, r)
+    }
+    const out: bool[] = []
+    for (const code of buttonCodes) {
+      out.push(testBit(keys, code))
+    }
+    return out
+  }
+
+  public close(): void {
+    if (!closed) {
+      closed = true
+      const release = this.closer
+      release(fd)
+    }
+  }
+
+  check(): void throws PadError {
+    if (closed) {
+      throw new PadError("CLOSED", `${path} is closed`)
+    }
+  }
+}
+
+/// What opens a node (the descriptor, or the errno as a NEGATIVE number) and what lets go of a descriptor: the system's, or (in a test) ones
+/// that keep a table of the descriptors they hand out and take back.
+export type Opener = (path: string) => int
+export type Closer = (fd: int) => void
+
+/// The pads of a Linux machine. `sysfs` and `dev` are for tests (a made-up tree), `ioctl` for tests too (canned answers), and so are the
+/// `opener` and the `closer` (a table of descriptors, to see that every one that was opened is let go of).
+export class LinuxSystem implements PadSystem {
+  readonly sysfs: string
+  readonly dev: string
+  readonly ioctl: Ioctl
+  readonly opener: Opener
+  readonly closer: Closer
+
+  constructor(sysfs: string = "/sys", dev: string = "/dev", ioctl: Ioctl = ask, opener: Opener = openRead, closer: Closer = closeFd) {
+    this.sysfs = sysfs
+    this.dev = dev
+    this.ioctl = ioctl
+    this.opener = opener
+    this.closer = closer
+  }
+
+  /// The joysticks among the event nodes, by what sysfs says of them: no node is opened, and only a joystick is listed.
+  public async scan(): Promise<PadInfo[]> {
+    const names: string[] = []
+    const paths: string[] = []
+    const vendors: int[] = []
+    const products: int[] = []
+    const uniqs: string[] = []
+    const physs: string[] = []
+    const infos: PadInfo[] = []
+    for (const node of await eventNodes(dev)) {
+      const sys = await sysfsOf(sysfs, node.name)
+      if (sys.kind == "joystick" && sys.vendor >= 0 && sys.product >= 0) {
+        names.push(sys.name)
+        paths.push(node.path)
+        vendors.push(sys.vendor)
+        products.push(sys.product)
+        uniqs.push(sys.uniq)
+        physs.push(sys.phys)
+        infos.push({
+          id: "",
+          legacyId: chromiumId(sys.name, sys.vendor, sys.product),
+          name: sys.name,
+          vendor: sys.vendor,
+          product: sys.product,
+          uniq: sys.uniq,
+          phys: sys.phys,
+          path: node.path,
+          source: "evdev",
+          axisCodes: sys.abs,
+          buttonCodes: joydevButtonOrder(sys.keys),
+        })
+      }
+    }
+    const ids = padIds(vendors, products, uniqs, physs)
+    for (let i = 0; i < infos.length; i++) {
+      infos[i].id = ids[i]
+    }
+    return infos
+  }
+
+  /// Opens a pad read-only: its axes with their ranges, and the device to read. Three checks stand before any state is asked of it:
+  /// the codes of `info` are codes (an axis 0 to ABS_MAX, a button 0 to KEY_MAX: an `EVIOCGABS` of a code past that would change the
+  /// ioctl's type byte), the node is a joystick by what sysfs says (a keyboard, a mouse, whatever path was given: `NOT_A_PAD`, not
+  /// opened), and, once it is open, it is still the pad that was listed: the kernel hands the lowest free event number to the next
+  /// device, so the node may be another between the sysfs read and the open. It is asked who it is (id, name, capabilities: never
+  /// what is pressed) and let go of at once when it is not (`CHANGED`, or `NOT_A_PAD` when it is not a joystick any more).
+  public async open(info: PadInfo): Promise<OpenedPad> throws PadError {
+    checkCodes(info)
+    const name = nodeName(info.path)
+    if (name == "") {
+      throw new PadError("NOT_FOUND", `${info.path} is not an event node`)
+    }
+    const sys = await sysfsOf(sysfs, name)
+    if (sys.kind != "joystick") {
+      throw new PadError("NOT_A_PAD", `${info.path} is not a joystick (it is a ${sys.kind}): not opened`)
+    }
+    const opener = this.opener
+    const release = this.closer
+    const fd = opener(info.path)
+    if (fd < 0) {
+      throw errorOf(`open ${info.path}`, fd)
+    }
+    const ask = this.ioctl
+    const wrong = whoIsThere(fd, info, ask)
+    if (wrong != null) {
+      release(fd)
+      throw wrong!
+    }
+    const axes: AxisInfo[] = []
+    for (let i = 0; i < info.axisCodes.length; i++) {
+      const code = info.axisCodes[i]
+      const buf = new Uint8Array(ABSINFO_BYTES)
+      const r = ask(fd, eviocgabs(code), buf)
+      if (r < 0) {
+        release(fd)
+        throw errorOf(`${info.path}: EVIOCGABS(${absName(code)})`, r)
+      }
+      const a = parseAbsInfo(buf)
+      axes.push({ index: i, code: code, name: absName(code), minimum: a.minimum, maximum: a.maximum, flat: a.flat, fuzz: a.fuzz })
+    }
+    return { axes: axes, device: new LinuxDevice(fd, info.path, info.axisCodes, info.buttonCodes, ioctl, release) }
+  }
+}
+
+/// The codes of a listing are the kernel's: axes 0 to `ABS_MAX`, buttons 0 to `KEY_MAX`. (A request number is built from them, in a field
+/// of 8 bits: one past that is another request.)
+function checkCodes(info: PadInfo): void throws PadError {
+  for (const code of info.axisCodes) {
+    if (code < 0 || code > ABS_MAX) {
+      throw new PadError("NOT_A_PAD", `${info.path}: axis code ${code} is not 0 to ${ABS_MAX}: not opened`)
+    }
+  }
+  for (const code of info.buttonCodes) {
+    if (code < 0 || code > KEY_MAX) {
+      throw new PadError("NOT_A_PAD", `${info.path}: button code ${code} is not 0 to ${KEY_MAX}: not opened`)
+    }
+  }
+}
+
+/// Who is behind an open node, asked of the descriptor with queries that say what a device IS (its id, its name, its capabilities) and
+/// never what is pressed: the pad that was listed has this vendor, product and name and is a joystick. Null when it is; else the error.
+function whoIsThere(fd: int, info: PadInfo, call: Ioctl): PadError? {
+  const idBuf = new Uint8Array(8)
+  const r = call(fd, eviocgid(), idBuf)
+  if (r < 0) {
+    return errorOf(`${info.path}: EVIOCGID`, r)
+  }
+  const id = parseId(idBuf)
+  if (id.vendor != info.vendor || id.product != info.product) {
+    return new PadError("CHANGED", `${info.path} is ${hex(id.vendor, 4)}:${hex(id.product, 4)} now, not ${hex(info.vendor, 4)}:${hex(info.product, 4)} (${info.name}): let go`)
+  }
+  const nameBuf = new Uint8Array(256)
+  if (call(fd, eviocgname(256), nameBuf) >= 0 && info.name != "" && cText(nameBuf) != info.name) {
+    return new PadError("CHANGED", `${info.path} is "${cText(nameBuf)}" now, not "${info.name}": let go`)
+  }
+  const types = new Uint8Array(4)
+  const abs = new Uint8Array(8)
+  const keys = new Uint8Array(KEY_MAX / 8 + 1)
+  call(fd, eviocgbit(0, types.length), types)
+  call(fd, eviocgbit(EV_ABS, abs.length), abs)
+  call(fd, eviocgbit(EV_KEY, keys.length), keys)
+  const kind = classify(testBit(types, EV_ABS), testBit(types, EV_REL), codesOf(abs, ABS_MAX), codesOf(keys, KEY_MAX))
+  if (kind != "joystick") {
+    return new PadError("NOT_A_PAD", `${info.path} is a ${kind} now, not a joystick: let go`)
+  }
+  return null
+}
+
+/// `event7` of `/dev/input/event7`, or "" when the path is not an event node.
+export function nodeName(path: string): string {
+  const at = path.lastIndexOf("/")
+  const name = path.slice(at + 1)
+  return if (name.startsWith("event") && name.length > 5) name else ""
+}

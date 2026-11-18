@@ -1,0 +1,8 @@
+// The pads of every platform without its own system.<os>.pi.
+import { UnsupportedSystem } from "./unsupported"
+import { PadSystem } from "./types"
+
+/// The pads of this machine: none, here.
+export function defaultSystem(): PadSystem {
+  return new UnsupportedSystem()
+}

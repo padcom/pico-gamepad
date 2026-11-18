@@ -1,0 +1,68 @@
+// The spike's formatting and statistics: no device.
+import { describe, it, expect } from "std/test"
+import { bar, fixed, modeText, parseJsEvent, percentileIndex, tickStats } from "./format"
+
+function numbersAreFormatted(): void {
+  expect(fixed(-0.5, 2)).toBe("-0.50")
+  expect(fixed(-0.0004, 3)).toBe("0.000")
+  expect(fixed(12.0, 0)).toBe("12")
+  expect(fixed(1.0, 3)).toBe("1.000")
+}
+
+function barsShowTheValueAndTheMiddle(): void {
+  expect(bar(0.0, 5)).toBe("[     |     ]")
+  expect(bar(1.0, 5)).toBe("[     |#####]")
+  expect(bar(-1.0, 5)).toBe("[#####|     ]")
+  expect(bar(0.4, 5)).toBe("[     |##   ]")
+  expect(bar(-0.4, 5)).toBe("[   ##|     ]")
+  expect(bar(1.7, 5)).toBe("[     |#####]")
+}
+
+function modesAreTold(): void {
+  expect(modeText(0x21b0)).toBe("crw-rw----")
+  expect(modeText(0x21a4)).toBe("crw-r--r--")
+  expect(modeText(0x41ed)).toBe("drwxr-xr-x")
+}
+
+function aJoystickEventIsDecoded(): void {
+  // time 0x01020304 ms, value -1 (0xffff), type JS_EVENT_AXIS | JS_EVENT_INIT (0x82), axis 4
+  const raw = new Uint8Array(16)
+  raw.set(8, 0x04 as u8)
+  raw.set(9, 0x03 as u8)
+  raw.set(10, 0x02 as u8)
+  raw.set(11, 0x01 as u8)
+  raw.set(12, 0xff as u8)
+  raw.set(13, 0xff as u8)
+  raw.set(14, 0x82 as u8)
+  raw.set(15, 4 as u8)
+  const e = parseJsEvent(raw, 8)
+  expect(e == null).toBe(false)
+  expect(`${e!.time} ${e!.value} ${e!.kind} ${e!.number}`).toBe("16909060 -1 130 4")
+  expect(parseJsEvent(raw, 9) == null).toBe(true)
+  expect(parseJsEvent(raw, -1) == null).toBe(true)
+}
+
+function ticksAreMeasuredByTheirGaps(): void {
+  // 20 ms apart, one late by 60 ms and one by 130 ms: 5 ticks, gaps 20000 20000 80000 150000
+  const stats = tickStats([0, 20000, 40000, 120000, 270000])
+  expect(stats.ticks).toBe(5)
+  expect(stats.minUs).toBe(20000)
+  expect(stats.maxUs).toBe(150000)
+  expect(stats.meanUs).toBe(67500)
+  expect(stats.over30ms).toBe(2)
+  expect(stats.over100ms).toBe(1)
+  expect(fixed(stats.perSecond, 2)).toBe("14.81")
+  expect(tickStats([5]).meanUs).toBe(0)
+  expect(tickStats([]).ticks).toBe(0)
+  expect(percentileIndex(100, 99)).toBe(99)
+  expect(percentileIndex(5, 99)).toBe(4)
+  expect(percentileIndex(1, 95)).toBe(0)
+}
+
+describe("the spike's helpers", () => {
+  it("format numbers", numbersAreFormatted)
+  it("draw bars with the middle marked", barsShowTheValueAndTheMiddle)
+  it("tell a mode as `ls` does", modesAreTold)
+  it("decode a joydev event of 8 bytes", aJoystickEventIsDecoded)
+  it("measure ticks by their gaps", ticksAreMeasuredByTheirGaps)
+})

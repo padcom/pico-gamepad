@@ -1,0 +1,49 @@
+// The parts of the spike's program that need no device: its command line and the little parsers. Importing `run` also makes the
+// compiler check the whole device code (the FFI, the probes, the watch), which is not RUN here: this test never touches /dev/input.
+import { describe, it, expect } from "std/test"
+import { isDigits, numberAfter, parseHex, parseOptions } from "./report"
+import { run } from "./run"
+
+function theCommandLineIsRead(): void {
+  const none = parseOptions([])
+  expect(`${none.seconds} ${none.hz} ${none.joydev} ${none.watchSeconds} "${none.device}" "${none.problem}"`).toBe(`10 50 false 0 "" ""`)
+  const all = parseOptions(["--seconds", "20", "--hz", "100", "--joydev", "--device", "/dev/input/js1", "--watch", "30"])
+  expect(`${all.seconds} ${all.hz} ${all.joydev} ${all.watchSeconds} ${all.device} "${all.problem}"`).toBe(`20 100 true 30 /dev/input/js1 ""`)
+}
+
+function aBadCommandLineIsSaid(): void {
+  expect(parseOptions(["--seconds"]).problem).toBe("--seconds wants a number of 1 to 600")
+  expect(parseOptions(["--hz", "0"]).problem).toBe("--hz wants a number of 1 to 600")
+  expect(parseOptions(["--watch", "x"]).problem).toBe("--watch wants a number of 1 to 600")
+  expect(parseOptions(["--device"]).problem).toBe("--device wants a path")
+  expect(parseOptions(["--frobnicate"]).problem).toBe("what is --frobnicate?")
+}
+
+function nodeNamesAreTold(): void {
+  expect(numberAfter("event12", "event")).toBe(12)
+  expect(numberAfter("js0", "js")).toBe(0)
+  expect(numberAfter("js0", "event")).toBe(-1)
+  expect(numberAfter("event", "event")).toBe(-1)
+  expect(numberAfter("event3x", "event")).toBe(-1)
+  expect(numberAfter("eventx", "event")).toBe(-1)
+  expect(isDigits("")).toBe(false)
+  expect(numberAfter("by-id", "event")).toBe(-1)
+  expect(parseHex("4f54")).toBe(0x4f54)
+  expect(parseHex("1209")).toBe(0x1209)
+  expect(parseHex("zz")).toBe(-1)
+}
+
+async function aBadCommandLineStopsBeforeAnythingIsOpened(): Promise<void> throws Error {
+  // (no device is touched: the command line is read first)
+  expect(await run(["--nonsense"])).toBe(2)
+}
+
+describe("the spike's command line", () => {
+  it("is read", theCommandLineIsRead)
+  it("says what is wrong with it", aBadCommandLineIsSaid)
+  it("stops a bad one before anything is opened", aBadCommandLineStopsBeforeAnythingIsOpened)
+})
+
+describe("the spike's parsers", () => {
+  it("tell the nodes and the hex numbers", nodeNamesAreTold)
+})

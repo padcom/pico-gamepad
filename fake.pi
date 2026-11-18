@@ -1,0 +1,147 @@
+// A pad that is a script, for the tests of whatever uses this package (and this package's own): no device, no permission, no
+// platform. A `FakeSystem` has pads that can be plugged in and out, whose `open` can be refused for a while (the desktop's ACL comes
+// a moment after the node), and whose readings the test sets.
+import { PadDevice, PadError, PadInfo, PadSystem, AxisInfo, OpenedPad } from "./types"
+import { absName } from "./ioctl"
+import { chromiumId, padIds } from "./decode"
+
+/// A device whose readings are set by the test. `unplug()` makes the next read fail with `DISCONNECTED`, as a real one does.
+export class FakeDevice implements PadDevice {
+  public raw: int[] = []
+  public down: bool[] = []
+  public gone: bool = false
+  public closed: bool = false
+  /// How many times the axes were read.
+  public reads: int = 0
+
+  constructor(axes: int, buttons: int, rest: int) {
+    for (let i = 0; i < axes; i++) {
+      this.raw.push(rest)
+    }
+    for (let i = 0; i < buttons; i++) {
+      this.down.push(false)
+    }
+  }
+
+  /// Sets what axis `index` says.
+  public set(index: int, value: int): void {
+    raw[index] = value
+  }
+
+  /// Presses or releases button `index`.
+  public press(index: int, pressed: bool = true): void {
+    down[index] = pressed
+  }
+
+  /// The device is gone: the next read fails.
+  public unplug(): void {
+    gone = true
+  }
+
+  public rawAxes(): int[] throws PadError {
+    if (gone) {
+      throw new PadError("DISCONNECTED", "no such device (ENODEV)", 19)
+    }
+    reads += 1
+    return raw.slice(0)
+  }
+
+  public buttons(): bool[] throws PadError {
+    if (gone) {
+      throw new PadError("DISCONNECTED", "no such device (ENODEV)", 19)
+    }
+    return down.slice(0)
+  }
+
+  public close(): void {
+    closed = true
+  }
+}
+
+/// What a listing says of a made-up pad with `axes` axes (ABS codes 0 up) and `buttons` buttons (codes from BTN_SOUTH up).
+export function fakeInfo(name: string, vendor: int, product: int, axes: int, buttons: int, uniq: string, phys: string, path: string): PadInfo {
+  const axisCodes: int[] = []
+  for (let i = 0; i < axes; i++) {
+    axisCodes.push(i)
+  }
+  const buttonCodes: int[] = []
+  for (let i = 0; i < buttons; i++) {
+    buttonCodes.push(0x130 + i)
+  }
+  return {
+    id: padIds([vendor], [product], [uniq], [phys])[0],
+    legacyId: chromiumId(name, vendor, product),
+    name: name,
+    vendor: vendor,
+    product: product,
+    uniq: uniq,
+    phys: phys,
+    path: path,
+    source: "fake",
+    axisCodes: axisCodes,
+    buttonCodes: buttonCodes,
+  }
+}
+
+/// A made-up machine. Its axes read 0 to 2047 with a rest of 1023, as the TX16S's do.
+export class FakeSystem implements PadSystem {
+  public pads: PadInfo[] = []
+  public devices: FakeDevice[] = []
+  /// The next this many `open`s fail with `PERMISSION_DENIED` (the ACL that has not come yet); 1000000 for a pad that never opens.
+  public denyOpens: int = 0
+  /// How many times `scan` and `open` were called.
+  public scans: int = 0
+  public opens: int = 0
+
+  /// Plugs a pad in (its device is `device(info.path)`).
+  public plug(info: PadInfo): FakeDevice {
+    const device = new FakeDevice(info.axisCodes.length, info.buttonCodes.length, 1023)
+    pads.push(info)
+    devices.push(device)
+    return device
+  }
+
+  /// Unplugs the pad at `path`: it is no longer listed, and its device answers `DISCONNECTED`.
+  public unplug(path: string): void {
+    for (let i = pads.length - 1; i >= 0; i--) {
+      if (pads[i].path == path) {
+        devices[i].unplug()
+        pads.splice(i, 1)
+        devices.splice(i, 1)
+      }
+    }
+  }
+
+  /// The device of the pad at `path`.
+  public device(path: string): FakeDevice {
+    for (let i = 0; i < pads.length; i++) {
+      if (pads[i].path == path) {
+        return devices[i]
+      }
+    }
+    panic(`no fake pad at ${path}`)
+  }
+
+  public async scan(): Promise<PadInfo[]> {
+    scans += 1
+    return pads.slice(0)
+  }
+
+  public async open(info: PadInfo): Promise<OpenedPad> throws PadError {
+    opens += 1
+    for (let i = 0; i < pads.length; i++) {
+      if (pads[i].path == info.path) {
+        if (denyOpens > 0) {
+          denyOpens -= 1
+          throw new PadError("PERMISSION_DENIED", `open ${info.path}: permission denied (EACCES)`, 13)
+        }
+        const axes: AxisInfo[] = []
+        for (let a = 0; a < info.axisCodes.length; a++) {
+          axes.push({ index: a, code: info.axisCodes[a], name: absName(info.axisCodes[a]), minimum: 0, maximum: 2047, flat: 127, fuzz: 7 })
+        }
+        return { axes: axes, device: devices[i] }
+      }
+    }
+    throw new PadError("NOT_FOUND", `open ${info.path}: no such file or directory (ENOENT)`, 2)
+  }
+}

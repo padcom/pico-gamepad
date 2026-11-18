@@ -1,0 +1,66 @@
+// A pad that is open: what it has, and what it says NOW. A reading is the kernel's state of the moment, taken when `state()` is
+// called, never an old sample: whoever calls it at 50 Hz gets 50 fresh readings, and one that does not call gets none.
+import { normalise } from "./decode"
+import { defaultSystem } from "./system"
+import { AxisInfo, PadDevice, PadError, PadInfo, PadState, PadSystem } from "./types"
+
+/// Microseconds on the machine's monotonic clock (`performance.now()`, from the program's start).
+export function monotonicUs(): int {
+  return (performance.now() * 1000.0) as int
+}
+
+export class Pad {
+  /// What the system listed.
+  public readonly info: PadInfo
+  /// The axes with the ranges the device declares (index 0 is the lowest ABS code).
+  public readonly axes: AxisInfo[]
+  readonly device: PadDevice
+  readonly clock: () => int
+  closed: bool = false
+
+  constructor(info: PadInfo, axes: AxisInfo[], device: PadDevice, clock: () => int = monotonicUs) {
+    this.info = info
+    this.axes = axes
+    this.device = device
+    this.clock = clock
+  }
+
+  /// What the pad says now: every axis (raw, and -1 to 1 by its declared range) and every button, with the time it was read.
+  /// Throws `DISCONNECTED` when the device is gone (an unplugged pad answers so on the very next read), `CLOSED` after `close()`.
+  public state(): PadState throws PadError {
+    if (closed) {
+      throw new PadError("CLOSED", `${info.path} is closed`)
+    }
+    const raw = device.rawAxes()
+    const buttons = device.buttons()
+    if (raw.length != axes.length) {
+      throw new PadError("IO", `${info.path}: ${raw.length} axes read, ${axes.length} expected`)
+    }
+    const normalised: f64[] = []
+    for (let i = 0; i < raw.length; i++) {
+      normalised.push(normalise(raw[i], axes[i].minimum, axes[i].maximum))
+    }
+    const read = this.clock
+    return { at: read(), raw: raw, axes: normalised, buttons: buttons }
+  }
+
+  /// Lets go of the device. Twice is fine.
+  public close(): void {
+    if (!closed) {
+      closed = true
+      device.close()
+    }
+  }
+}
+
+/// The pads plugged in now (joysticks only), in a stable order. Nothing is opened: this is what the system says of them.
+export async function listPads(system: PadSystem = defaultSystem()): Promise<PadInfo[]> {
+  return await system.scan()
+}
+
+/// Opens a pad from the list. Throws `PERMISSION_DENIED` when this user may not (yet), `NOT_A_PAD` for anything but a joystick,
+/// `NOT_FOUND` when it is gone, `UNSUPPORTED` on a platform without a backend.
+export async function openPad(info: PadInfo, system: PadSystem = defaultSystem()): Promise<Pad> throws PadError {
+  const opened = await system.open(info)
+  return new Pad(info, opened.axes, opened.device)
+}

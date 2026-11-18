@@ -1,0 +1,131 @@
+// G0 spike: the pure helpers only the probe needs (formatting, the tick statistics, joydev's event). The library's own decoding is in
+// ../decode.pi.
+import { JS_EVENT_BYTES } from "../ioctl"
+import { s16At, u32At } from "../decode"
+
+/// `x` with `digits` decimals (`fixed(-0.5, 2)` is `-0.50`).
+export function fixed(x: f64, digits: int): string {
+  let scale = 1
+  for (let i = 0; i < digits; i++) {
+    scale *= 10
+  }
+  const scaled = Math.round(x * (scale as f64)) as int
+  const absolute = if (scaled < 0) -scaled else scaled
+  const sign = if (scaled < 0) "-" else ""
+  if (digits == 0) {
+    return `${sign}${absolute}`
+  }
+  return `${sign}${absolute / scale}.${`${absolute % scale}`.padStart(digits, "0")}`
+}
+
+/// A bar for -1 to 1 with the middle marked, `half` cells each side of it: `[     |##   ]` is 0.4 with a `half` of 5.
+export function bar(x: f64, half: int): string {
+  const magnitude = if (x < 0.0) -x else x
+  const rounded = Math.round(magnitude * (half as f64)) as int
+  const cells = if (rounded > half) half else rounded
+  let left = " ".repeat(half)
+  let right = " ".repeat(half)
+  if (x < 0.0 && cells > 0) {
+    left = " ".repeat(half - cells) + "#".repeat(cells)
+  } else if (x > 0.0 && cells > 0) {
+    right = "#".repeat(cells) + " ".repeat(half - cells)
+  }
+  return `[${left}|${right}]`
+}
+
+/// `ls -l`'s text of a file's mode (`crw-rw----`): the type, then the permission bits of the owner, the group and the others.
+export function modeText(mode: int): string {
+  const kind = match (mode & 0xf000) {
+    0x2000 => "c",
+    0x6000 => "b",
+    0x4000 => "d",
+    0xa000 => "l",
+    0x8000 => "-",
+    _ => "?",
+  }
+  const rwx = "rwxrwxrwx"
+  let bits = ""
+  for (let i = 0; i < 9; i++) {
+    bits += if (((mode >> (8 - i)) & 1) == 1) rwx.slice(i, i + 1) else "-"
+  }
+  return kind + bits
+}
+
+/// One `struct js_event` of joydev: when (ms), the value, the kind (`JS_EVENT_BUTTON` or `JS_EVENT_AXIS`, with `JS_EVENT_INIT` or'ed
+/// in for the state at open) and which axis or button.
+export struct JsEvent {
+  time: int
+  value: int
+  kind: int
+  number: int
+}
+
+/// Reads a `js_event` (8 bytes) at `at`, or null when `b` is too short for one there.
+export function parseJsEvent(b: Uint8Array, at: int): JsEvent? {
+  if (at < 0 || at + JS_EVENT_BYTES > b.length) {
+    return null
+  }
+  return { time: u32At(b, at), value: s16At(b, at + 4), kind: b.get(at + 6) as int, number: b.get(at + 7) as int }
+}
+
+/// How a run of ticks went, from the times they happened at (µs on a monotonic clock): how many, the gaps between them (mean,
+/// shortest, longest, the 95th and the 99th percentile), how many gaps were longer than 30 ms and than 100 ms (the page's "late"),
+/// and the rate.
+export struct TickStats {
+  ticks: int
+  meanUs: int
+  minUs: int
+  maxUs: int
+  p95Us: int
+  p99Us: int
+  over30ms: int
+  over100ms: int
+  perSecond: f64
+}
+
+/// The index of the `percent`th percentile in `n` sorted values (the last one at most).
+export function percentileIndex(n: int, percent: int): int {
+  const at = n * percent / 100
+  return if (at > n - 1) n - 1 else at
+}
+
+/// The statistics of the gaps between `times` (µs, ascending). Fewer than two ticks have none: all zeros.
+export function tickStats(times: int[]): TickStats {
+  const empty: TickStats = {
+    ticks: times.length, meanUs: 0, minUs: 0, maxUs: 0, p95Us: 0, p99Us: 0, over30ms: 0, over100ms: 0, perSecond: 0.0,
+  }
+  if (times.length < 2) {
+    return empty
+  }
+  const gaps: int[] = []
+  let over30 = 0
+  let over100 = 0
+  for (let i = 1; i < times.length; i++) {
+    const gap = times[i] - times[i - 1]
+    gaps.push(gap)
+    if (gap > 30000) {
+      over30 += 1
+    }
+    if (gap > 100000) {
+      over100 += 1
+    }
+  }
+  const sorted = gaps.slice(0)
+  sorted.sort()
+  let sum = 0
+  for (const g of gaps) {
+    sum += g
+  }
+  const span = times[times.length - 1] - times[0]
+  return {
+    ticks: times.length,
+    meanUs: sum / gaps.length,
+    minUs: sorted[0],
+    maxUs: sorted[sorted.length - 1],
+    p95Us: sorted[percentileIndex(sorted.length, 95)],
+    p99Us: sorted[percentileIndex(sorted.length, 99)],
+    over30ms: over30,
+    over100ms: over100,
+    perSecond: if (span > 0) ((times.length - 1) as f64) * 1000000.0 / (span as f64) else 0.0,
+  }
+}

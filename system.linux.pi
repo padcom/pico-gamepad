@@ -1,0 +1,8 @@
+// The pads of a Linux machine: evdev.
+import { LinuxSystem } from "./evdev"
+import { PadSystem } from "./types"
+
+/// The pads of this machine (/dev/input and sysfs).
+export function defaultSystem(): PadSystem {
+  return new LinuxSystem()
+}
