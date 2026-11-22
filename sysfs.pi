@@ -1,6 +1,7 @@
 // What /dev/input and sysfs say of the input devices without opening any of them (Linux). A keyboard's capabilities can be read here
 // without opening the keyboard: only a node that is a joystick is ever opened.
-import { readDir, readText } from "std/fs"
+import { readDir } from "std/fs"
+import { attributeOr, parseHex as hexOf } from "padcom/pico-linux-sysfs"
 import { ABS_MAX, EV_ABS, EV_REL, KEY_MAX } from "./ioctl"
 import { classify, codesOfSysfs } from "./decode"
 
@@ -9,8 +10,8 @@ export function isDigits(s: string): bool {
   if (s.length == 0) {
     return false
   }
-  for (let i = 0; i < s.length; i++) {
-    if ("0123456789".indexOf(s.slice(i, i + 1)) < 0) {
+  for (const c of s) {
+    if (!c.isDigit()) {
       return false
     }
   }
@@ -28,28 +29,12 @@ export function numberAfter(name: string, prefix: string): int {
 
 /// A hex number (`1209`) as an int, or -1.
 export function parseHex(s: string): int {
-  const digits = "0123456789abcdef"
-  let v = 0
-  if (s.length == 0) {
-    return -1
-  }
-  for (let i = 0; i < s.length; i++) {
-    const d = digits.indexOf(s.slice(i, i + 1).toLowerCase())
-    if (d < 0) {
-      return -1
-    }
-    v = v * 16 + d
-  }
-  return v
+  return hexOf(s) ?? -1
 }
 
 /// The text of a file, trimmed, or `otherwise` when it cannot be read.
 export async function readOr(path: string, otherwise: string): Promise<string> {
-  try {
-    return (await readText(path)).trim()
-  } catch (e: Error) {
-    return otherwise
-  }
+  return await attributeOr(path, otherwise)
 }
 
 /// A node of `<dev>/input`: `event3` is number 3.

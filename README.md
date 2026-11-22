@@ -6,6 +6,8 @@ Status: **Linux first** (evdev). On every other platform a program using the pac
 
 It is the native piece behind the drone configurator's joystick reader. It doesn't depend on it and works in any Pico program.
 
+It needs pico 0.10.0 or later (`std/posix`, `DataView`), and reads sysfs through [pico-linux-sysfs](https://github.com/padcom/pico-linux-sysfs).
+
 ## Use
 
 ```pico
