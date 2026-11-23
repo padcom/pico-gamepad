@@ -79,24 +79,22 @@ export function errnoName(e: int): string {
 
 /// A little-endian u16 of `b` at `at`.
 export function u16At(b: Uint8Array, at: int): int {
-  return (b.get(at) as int) | ((b.get(at + 1) as int) << 8)
+  return new DataView(b).getUint16(at, true)
 }
 
 /// A little-endian u32 of `b` at `at`.
 export function u32At(b: Uint8Array, at: int): int {
-  return u16At(b, at) | (u16At(b, at + 2) << 16)
+  return new DataView(b).getUint32(at, true)
 }
 
 /// A little-endian s32 of `b` at `at`.
 export function s32At(b: Uint8Array, at: int): int {
-  const v = u32At(b, at)
-  return if (v >= 2147483648) v - 4294967296 else v
+  return new DataView(b).getInt32(at, true)
 }
 
 /// A little-endian s16 of `b` at `at`.
 export function s16At(b: Uint8Array, at: int): int {
-  const v = u16At(b, at)
-  return if (v >= 32768) v - 65536 else v
+  return new DataView(b).getInt16(at, true)
 }
 
 /// `struct input_id`.
@@ -136,15 +134,7 @@ export function parseAbsInfo(b: Uint8Array): AbsInfo {
 
 /// The text of a NUL-terminated buffer (what the kernel fills in for a name, a phys or a uniq).
 export function cText(b: Uint8Array): string {
-  let n = 0
-  while (n < b.length && b.get(n) != 0) {
-    n += 1
-  }
-  try {
-    return new TextDecoder().decode(b.subarray(0, n))
-  } catch (e: TypeError) {
-    return ""
-  }
+  return string.fromCBytes(b)
 }
 
 /// An axis value as -1 to 1 from its declared range: nothing is calibrated, the range the device declares is the range. A range

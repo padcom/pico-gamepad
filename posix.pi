@@ -1,39 +1,12 @@
-// The C calls a device read needs (Linux), declared directly. `ioctl` is variadic in C: it is declared so here (`...`), and its third
-// argument is the address of a buffer (see `addr`). Nothing here knows what a joystick is.
+// The device calls a pad needs (Linux), on std/posix's shared declarations (`open`, `ioctl`, `errno`, …): an ioctl's third
+// argument is the buffer's address (`ptr.bytes`). Nothing here knows what a joystick is.
+import { EINTR, O_CLOEXEC, O_NONBLOCK, O_RDONLY, close, errno, errnoMessage, ioctl, open } from "std/posix"
 
-export extern "C" {
-  function open(path: string, flags: c_int): c_int
-  function close(fd: c_int): c_int
-  function ioctl(fd: c_int, request: c_ulong, ...): c_int
-  function __errno_location(): ptr<c_int>
-  function strerror(e: c_int): ptr<u8>
-}
-
-/// Open flags (Linux, x86-64 and arm64): read only, do not wait for the device, close on exec.
-export const O_RDONLY: int = 0
-export const O_NONBLOCK: int = 0x800
-export const O_CLOEXEC: int = 0x80000
-
-/// EINTR: a call that a signal interrupted (it is tried once more).
-const EINTR: int = 4
-
-/// The byte address of a view's first byte, for C. (The `ArrayBuffer`'s memory is the runtime's `__handle`.)
-export function addr(b: Uint8Array): usize {
-  return (b.buffer.__handle + b.byteOffset) as usize
-}
-
-/// `errno` after a failed call.
-export function errno(): int {
-  unsafe {
-    return __errno_location().read() as int
-  }
-}
+export { errno } from "std/posix"
 
 /// `strerror(e)`.
 export function describe(e: int): string {
-  unsafe {
-    return string.fromC(strerror(e as c_int))
-  }
+  return errnoMessage(e)
 }
 
 /// Opens `path` for reading without waiting (and without taking the device from anyone: no `EVIOCGRAB`, no write). The descriptor, or
@@ -56,9 +29,9 @@ export function closeFd(fd: int): void {
 /// An `ioctl` that fills `buf`: what the call returned (0 or a length), or the errno as a NEGATIVE number. A call that a signal
 /// interrupted (EINTR) is made once more.
 export function ask(fd: int, request: int, buf: Uint8Array): int {
-  let r = ioctl(fd as c_int, request as c_ulong, addr(buf)) as int
+  let r = unsafe { ioctl(fd as c_int, request as c_ulong, ptr.bytes(buf)) } as int
   if (r < 0 && errno() == EINTR) {
-    r = ioctl(fd as c_int, request as c_ulong, addr(buf)) as int
+    r = unsafe { ioctl(fd as c_int, request as c_ulong, ptr.bytes(buf)) } as int
   }
   if (r < 0) {
     return -errno()
